@@ -1,118 +1,97 @@
 #!/usr/bin/env python3
-import sys, os, json, re
-from glob import glob
+"""
+extract_shares.py
+---------------
+Extract shares outstanding from SEC companyfacts JSONs (unzipped from companyfacts.zip).
+Writes to `latest-shares.jsonl` (JSON Lines: one record per line).
+Also writes `meta.json` with counters.
+"""
 
-def pad10(s):
-    s = re.sub(r'\D','', str(s or ''))
-    return ('0000000000' + s)[-10:] if s else ''
+import os
+import glob
+import json
+from datetime import datetime
 
-def choose_latest(arr):
-    best = None  # (end, val)
-    for d in arr or []:
-        end = d.get('end')
-        val = d.get('val')
-        if not end or not isinstance(val, (int, float)):  # skip non-numeric
-            continue
-        if best is None or end > best[0]:
-            best = (end, float(val))
-    return best
+CF_DIR = "cf"  # unzip destination
+OUT_FILE = "latest-shares.jsonl"
+META_FILE = "meta.json"
 
-def extract_one_companyfacts(path):
-    with open(path, 'r') as f:
-        j = json.load(f)
-    facts = (j.get('facts') or {})
-    dei   = (facts.get('dei') or {})
-    gaap  = (facts.get('us-gaap') or {})
-
-    # Prefer dei:EntityCommonStockSharesOutstanding, fallback to us-gaap:CommonStockSharesOutstanding
-    out_candidates = []
-    for family, key in (('dei','EntityCommonStockSharesOutstanding'),
-                        ('us-gaap','CommonStockSharesOutstanding')):
-        node = (dei if family=='dei' else gaap).get(key)
-        if not node: 
-            continue
-        units = node.get('units') or {}
-        # pick unit names containing "share", else all
-        unit_keys = [k for k in units.keys() if 'share' in k.lower()] or list(units.keys())
-        for uk in unit_keys:
-            latest = choose_latest(units.get(uk))
-            if latest:
-                out_candidates.append(latest)
-
-    if not out_candidates:
-        return None  # no usable value
-    # choose the overall most recent by end-date
-    return max(out_candidates, key=lambda x: x[0])  # (asof, value)
-
-def load_ticker_map(tickers_json_path):
-    with open(tickers_json_path, 'r') as f:
-        data = json.load(f)
-    # Handles both dict indexed by ints {"0":{...}} and array forms
-    iterable = data.values() if isinstance(data, dict) else data
-    cik_to_ticker = {}
-    seen = set()
-    for rec in iterable:
-        cik10 = pad10(rec.get('cik_str'))
-        tkr   = (rec.get('ticker') or '').upper()
-        if cik10 and tkr and tkr not in seen:
-            cik_to_ticker[cik10] = tkr
-            seen.add(tkr)
-    return cik_to_ticker
-
-def main():
-    if len(sys.argv) < 4:
-        print("Usage: extract_shares.py <companyfacts_dir> <tickers.json> <out_dir>", file=sys.stderr)
-        sys.exit(2)
-
-    cf_dir = sys.argv[1]
-    tickers_json = sys.argv[2]
-    out_dir = sys.argv[3]
-    os.makedirs(out_dir, exist_ok=True)
-
-    cik_to_ticker = load_ticker_map(tickers_json)
-    files = glob(os.path.join(cf_dir, "CIK*.json"))
-    print(f"[DEBUG] Looking for JSON in: {cf_dir}")
-    print(f"[DEBUG] Found {len(files)} files")
+def find_companyfacts_files():
+    # First try cf/ directly
+    files = glob.glob(os.path.join(CF_DIR, "CIK*.json"))
+    if not files:
+        # fallback if SEC changes folder layout
+        files = glob.glob(os.path.join(CF_DIR, "companyfacts", "CIK*.json"))
+    print(f"[DEBUG] Found {len(files)} JSON files")
     if files[:5]:
         print("[DEBUG] Sample files:", files[:5])
-    total = len(files)
-    wrote = 0
+    return files
 
-    out_path = os.path.join(out_dir, "latest-shares.jsonl")
-    meta_path = os.path.join(out_dir, "meta.json")
+def extract_shares_from_file(path):
+    """Return list of share records from one CIK file"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            j = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Failed to parse {path}: {e}")
+        return []
 
-    with open(out_path, 'w') as OUT:
-        for i, path in enumerate(files, 1):
-            cik10 = pad10(os.path.basename(path)[3:13])  # "CIK0000123456.json" → "0000123456"
-            tkr = cik_to_ticker.get(cik10)
-            if not tkr:
+    cik = str(j.get("cik", "")).zfill(10)
+    ticker = (j.get("ticker") or "").upper()
+    out = []
+
+    facts = j.get("facts", {})
+    # Look in dei or us-gaap
+    candidates = []
+    if "dei" in facts and "EntityCommonStockSharesOutstanding" in facts["dei"]:
+        candidates.append(facts["dei"]["EntityCommonStockSharesOutstanding"])
+    if "us-gaap" in facts and "CommonStockSharesOutstanding" in facts["us-gaap"]:
+        candidates.append(facts["us-gaap"]["CommonStockSharesOutstanding"])
+
+    for fact in candidates:
+        if not fact or "units" not in fact:
+            continue
+        for unit, arr in fact["units"].items():
+            for rec in arr:
+                val = rec.get("val")
+                end = rec.get("end")
+                if isinstance(val, (int, float)) and end:
+                    out.append({
+                        "symbol": ticker,
+                        "cik": cik,
+                        "shares_outstanding": val,
+                        "shares_asof": end,
+                        "source": "sec_companyfacts",
+                        "fetch_ts": datetime.utcnow().strftime("%Y-%m-%d")
+                    })
+    return out
+
+def main():
+    files = find_companyfacts_files()
+    total_files = 0
+    total_rows = 0
+
+    with open(OUT_FILE, "w", encoding="utf-8") as fout:
+        for path in files:
+            rows = extract_shares_from_file(path)
+            total_files += 1
+            if not rows:
                 continue
-            res = extract_one_companyfacts(path)
-            if not res:
-                continue
-            asof, val = res
-            if val <= 0:
-                continue
-            OUT.write(json.dumps({
-                "cik": cik10,
-                "ticker": tkr,
-                "shares": int(val),
-                "asof": asof
-            }) + "\n")
-            wrote += 1
-            if i % 1000 == 0:
-                print(f"processed {i}/{total} (wrote {wrote})")
+            for r in rows:
+                fout.write(json.dumps(r) + "\n")
+                total_rows += 1
 
     meta = {
         "source_zip": "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
         "tickers_source": "https://www.sec.gov/files/company_tickers.json",
-        "companies_scanned": total,
-        "rows_written": wrote
+        "companies_scanned": total_files,
+        "rows_written": total_rows,
+        "generated_utc": datetime.utcnow().isoformat()
     }
-    with open(meta_path, 'w') as M:
-        json.dump(meta, M)
+    with open(META_FILE, "w", encoding="utf-8") as f:
+        json.dump(meta, f)
 
-    print(f"Done. wrote={wrote} rows to {out_path}")
+    print(f"[INFO] Finished. Companies scanned={total_files}, rows_written={total_rows}")
 
 if __name__ == "__main__":
     main()
