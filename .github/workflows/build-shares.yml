@@ -54,6 +54,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+          
+      - name: Normalize extracted location
+        run: |
+          mkdir -p cf/companyfacts
+          shopt -s nullglob
+          mv CIK*.json cf/companyfacts/ || true
+
 
       - name: Extract latest shares
         run: |
