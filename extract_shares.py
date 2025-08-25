@@ -8,27 +8,21 @@ Also writes `meta.json` with counters.
 """
 
 import os
+import sys
 import glob
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
-CF_DIR = "cf"  # unzip destination
-OUT_FILE = "latest-shares.jsonl"
-META_FILE = "meta.json"
-
-def find_companyfacts_files():
-    # First try cf/ directly
-    files = glob.glob(os.path.join(CF_DIR, "CIK*.json"))
+def find_companyfacts_files(cf_dir):
+    files = glob.glob(os.path.join(cf_dir, "CIK*.json"))
     if not files:
-        # fallback if SEC changes folder layout
-        files = glob.glob(os.path.join(CF_DIR, "companyfacts", "CIK*.json"))
+        files = glob.glob(os.path.join(cf_dir, "companyfacts", "CIK*.json"))
     print(f"[DEBUG] Found {len(files)} JSON files")
     if files[:5]:
         print("[DEBUG] Sample files:", files[:5])
     return files
 
 def extract_shares_from_file(path):
-    """Return list of share records from one CIK file"""
     try:
         with open(path, "r", encoding="utf-8") as f:
             j = json.load(f)
@@ -41,7 +35,6 @@ def extract_shares_from_file(path):
     out = []
 
     facts = j.get("facts", {})
-    # Look in dei or us-gaap
     candidates = []
     if "dei" in facts and "EntityCommonStockSharesOutstanding" in facts["dei"]:
         candidates.append(facts["dei"]["EntityCommonStockSharesOutstanding"])
@@ -62,21 +55,27 @@ def extract_shares_from_file(path):
                         "shares_outstanding": val,
                         "shares_asof": end,
                         "source": "sec_companyfacts",
-                        "fetch_ts": datetime.utcnow().strftime("%Y-%m-%d")
+                        "fetch_ts": datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     })
     return out
 
 def main():
-    files = find_companyfacts_files()
-    total_files = 0
-    total_rows = 0
+    # --- args ---
+    cf_dir = sys.argv[1] if len(sys.argv) > 1 else "cf"
+    # sys.argv[2] could be tickers.json path, ignore for now
+    out_dir = sys.argv[3] if len(sys.argv) > 3 else "."
+    os.makedirs(out_dir, exist_ok=True)
 
-    with open(OUT_FILE, "w", encoding="utf-8") as fout:
+    out_file = os.path.join(out_dir, "latest-shares.jsonl")
+    meta_file = os.path.join(out_dir, "meta.json")
+
+    files = find_companyfacts_files(cf_dir)
+    total_files, total_rows = 0, 0
+
+    with open(out_file, "w", encoding="utf-8") as fout:
         for path in files:
             rows = extract_shares_from_file(path)
             total_files += 1
-            if not rows:
-                continue
             for r in rows:
                 fout.write(json.dumps(r) + "\n")
                 total_rows += 1
@@ -86,12 +85,13 @@ def main():
         "tickers_source": "https://www.sec.gov/files/company_tickers.json",
         "companies_scanned": total_files,
         "rows_written": total_rows,
-        "generated_utc": datetime.utcnow().isoformat()
+        "generated_utc": datetime.now(timezone.utc).isoformat()
     }
-    with open(META_FILE, "w", encoding="utf-8") as f:
+    with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f)
 
     print(f"[INFO] Finished. Companies scanned={total_files}, rows_written={total_rows}")
+    print(f"[INFO] Outputs: {out_file}, {meta_file}")
 
 if __name__ == "__main__":
     main()
