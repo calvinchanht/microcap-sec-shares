@@ -34,6 +34,13 @@ jobs:
           mkdir -p cf
           unzip -q companyfacts.zip -d cf
 
+      - name: Debug unzip
+        run: |
+          echo "[DEBUG] Listing top-level files:"
+          ls -lh cf | head
+          echo "[DEBUG] Listing companyfacts subfolder:"
+          ls -lh cf/companyfacts | head
+
       - name: Download company_tickers.json (SEC, then fallback to your Cloudflare mirror)
         run: |
           set -e

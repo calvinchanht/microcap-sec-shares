@@ -71,6 +71,10 @@ def main():
 
     cik_to_ticker = load_ticker_map(tickers_json)
     files = glob(os.path.join(cf_dir, "CIK*.json"))
+    print(f"[DEBUG] Looking for JSON in: {cf_dir}")
+    print(f"[DEBUG] Found {len(files)} files")
+    if files[:5]:
+        print("[DEBUG] Sample files:", files[:5])
     total = len(files)
     wrote = 0
 
