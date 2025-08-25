@@ -1,4 +1,4 @@
-name: Build & Publish Shares (EDGAR)
+name: Build Shares Mirror (daily)
 
 on:
   workflow_dispatch:
@@ -6,81 +6,107 @@ on:
     - cron: "17 7 * * *"   # daily ~07:17 UTC
 
 permissions:
-  contents: read
-  pages: write
+  contents: write     # needed for heartbeat commit
+  pages: write        # needed to deploy to Pages
   id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
+      # --- Get current UTC day-of-month for heartbeat condition ---
+      - id: dateout
+        name: Get day-of-month (UTC)
+        run: echo "DAY=$(date -u +%d)" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare workspace
-        run: |
-          mkdir -p public
-          echo "UA=Mozilla/5.0 MicroCap microcap@gmail.com" >> $GITHUB_ENV
+      - name: Prepare output dir
+        run: mkdir -p public
 
-      - name: Download SEC companyfacts.zip
-        run: |
-          curl -L --fail \
-            -H "User-Agent: $UA" \
-            -o companyfacts.zip \
-            https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
-
-      - name: Unzip (this takes a few minutes)
-        run: |
-          mkdir -p cf
-          unzip -q companyfacts.zip -d cf
-
-      - name: Debug unzip
-        run: |
-          echo "[DEBUG] Listing top-level files:"
-          ls -lh cf | head
-          echo "[DEBUG] Listing companyfacts subfolder:"
-          ls -lh cf/companyfacts | head
-
-      - name: Download company_tickers.json (SEC, then fallback to your Cloudflare mirror)
+      # --- Download SEC companyfacts.zip ---
+      - name: Download companyfacts.zip
         run: |
           set -e
-          curl -L --fail -H "User-Agent: $UA" \
-            -o tickers.json https://www.sec.gov/files/company_tickers.json \
-          || curl -L --fail \
-            -o tickers.json https://microcapsec.calvinchanht.workers.dev/sec/files/company_tickers.json
-          jq 'length' tickers.json || true
+          curl -L -o companyfacts.zip \
+            https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
 
-      - name: Python 3
+      # --- Unzip to cf/ (SEC changed layout: top-level JSONs) ---
+      - name: Unzip companyfacts
+        run: |
+          set -e
+          mkdir -p cf
+          unzip -q companyfacts.zip -d cf
+          echo "[DEBUG] Top-level after unzip:"
+          ls -lh | head -50 || true
+          echo "[DEBUG] cf listing (first 50):"
+          ls -1 cf | head -50 || true
+          echo "[DEBUG] Count of JSON files in cf:"
+          find cf -maxdepth 1 -type f -name 'CIK*.json' | wc -l
+
+      # --- Download tickers mapping (SEC JSON) ---
+      - name: Download tickers.json
+        run: |
+          set -e
+          curl -L -o tickers.json https://www.sec.gov/files/company_tickers.json
+          wc -c tickers.json
+          head -c 200 tickers.json || true
+
+      # --- Set up Python ---
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-          
-      - name: Normalize extracted location
-        run: |
-          mkdir -p cf/companyfacts
-          shopt -s nullglob
-          mv CIK*.json cf/companyfacts/ || true
+          python-version: "3.x"
 
-
-      - name: Extract latest shares
+      # --- Run extractor ---
+      - name: Extract latest shares per symbol
+        env:
+          UA: "Mozilla/5.0 MicroCap microcap@gmail.com"
         run: |
-          python3 extract_shares.py cf/companyfacts tickers.json public
+          set -e
+          python3 extract_shares.py cf tickers.json public
+          echo "[DEBUG] Output dir:"
           ls -lh public
+          echo "[DEBUG] Lines in latest-shares.jsonl:"
           wc -l public/latest-shares.jsonl || true
+          echo "[DEBUG] Meta preview:"
           jq '.' public/meta.json
 
-      - name: Upload Pages artifact
+      # --- Upload Pages artifact ---
+      - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
+      # --- Deploy to GitHub Pages ---
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      # --- Monthly heartbeat commit to avoid 60-day inactivity pause ---
+      # Only run on scheduled events, only on day 01 (UTC), and only on a branch ref
+      - name: Heartbeat commit (monthly)
+        if: ${{ github.event_name == 'schedule' && steps.dateout.outputs.DAY == '01' && startsWith(github.ref, 'refs/heads/') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # ensure we are on the branch we ran from
+          git pull --ff-only
+          mkdir -p automation
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > automation/heartbeat.txt
+          git add automation/heartbeat.txt
+          if git diff --cached --quiet; then
+            echo "No heartbeat changes to commit."
+          else
+            git commit -m "automation: heartbeat"
+            git push
+          fi
