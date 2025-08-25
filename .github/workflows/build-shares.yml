@@ -1,0 +1,72 @@
+name: Build & Publish Shares (EDGAR)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * *"   # daily ~07:17 UTC
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare workspace
+        run: |
+          mkdir -p public
+          echo "UA=MicroCapSheetsBot (contact: YOUR_CONTACT_EMAIL@EXAMPLE.COM)" >> $GITHUB_ENV
+
+      - name: Download SEC companyfacts.zip
+        run: |
+          curl -L --fail \
+            -H "User-Agent: $UA" \
+            -o companyfacts.zip \
+            https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
+
+      - name: Unzip (this takes a few minutes)
+        run: |
+          mkdir -p cf
+          unzip -q companyfacts.zip -d cf
+
+      - name: Download company_tickers.json (SEC, then fallback to your Cloudflare mirror)
+        run: |
+          set -e
+          curl -L --fail -H "User-Agent: $UA" \
+            -o tickers.json https://www.sec.gov/files/company_tickers.json \
+          || curl -L --fail \
+            -o tickers.json https://microcapsec.calvinchanht.workers.dev/sec/files/company_tickers.json
+          jq 'length' tickers.json || true
+
+      - name: Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Extract latest shares
+        run: |
+          python3 extract_shares.py cf tickers.json public
+          ls -lh public
+          wc -l public/latest-shares.jsonl || true
+          jq '.' public/meta.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
