@@ -50,7 +50,7 @@ jobs:
 
       - name: Extract latest shares
         run: |
-          python3 extract_shares.py cf tickers.json public
+          python3 extract_shares.py cf/companyfacts tickers.json public
           ls -lh public
           wc -l public/latest-shares.jsonl || true
           jq '.' public/meta.json

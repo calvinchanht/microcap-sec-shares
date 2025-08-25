@@ -70,7 +70,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     cik_to_ticker = load_ticker_map(tickers_json)
-    files = glob(os.path.join(cf_dir, "companyfacts", "CIK*.json"))
+    files = glob(os.path.join(cf_dir, "CIK*.json"))
     total = len(files)
     wrote = 0
 
