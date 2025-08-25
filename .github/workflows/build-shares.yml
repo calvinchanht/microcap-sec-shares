@@ -20,7 +20,7 @@ jobs:
       - name: Prepare workspace
         run: |
           mkdir -p public
-          echo "UA=MicroCapSheetsBot (contact: YOUR_CONTACT_EMAIL@EXAMPLE.COM)" >> $GITHUB_ENV
+          echo "UA=Mozilla/5.0 MicroCap microcap@gmail.com" >> $GITHUB_ENV
 
       - name: Download SEC companyfacts.zip
         run: |
