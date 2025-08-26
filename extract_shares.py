@@ -1,196 +1,186 @@
-#!/usr/bin/env python3
-# extract_shares.py — v0.5 (2025-08-25)
+# extract_shares.py — v1.3.0
+# - Tolerates cf/ or cf/companyfacts layouts (recursive discovery)
+# - Stronger symbol mapping from SEC tickers JSON (object-of-objects)
+# - Emits:
+#     public/latest-shares.jsonl   (all historical rows)
+#     public/latest-by-symbol.csv  (most recent per symbol)
+#     public/meta.json             (counters & sources)
 #
-# What’s new in v0.5
-# - In addition to full JSONL, emits compact per-symbol snapshots:
-#     public/latest-by-symbol.csv
-#     public/latest-by-symbol.json
-# - Picks the most recent shares_asof per symbol (ties broken by later file rows).
-# - Robust path discovery for CIK JSONs; joins SEC ticker map so "symbol" is filled.
+# Usage:
+#   python3 extract_shares.py <companyfacts_root> <tickers.json> <out_dir>
 
-import os
-import sys
-import re
-import glob
-import json
-from datetime import datetime, timezone
-from typing import Dict, List, Any, Tuple
+import json, os, sys, glob, datetime
+from datetime import datetime as dt
 
-def pad_cik10(cik: Any) -> str:
-    s = re.sub(r"\D", "", str(cik or ""))
-    return ("0000000000" + s)[-10:] if s else ""
+def utc_date():
+    return dt.now(datetime.UTC).date().isoformat()
 
-def find_companyfacts_files(cf_hint: str) -> List[str]:
-    candidates: List[str] = []
-    search_roots = []
-    if cf_hint:
-        search_roots += [cf_hint, os.path.join(cf_hint, "companyfacts")]
-    search_roots += [".", "cf", os.path.join("cf", "companyfacts")]
+def is_share_unit(k: str) -> bool:
+    k = (k or "").lower()
+    return "share" in k
 
-    seen = set()
-    for root in search_roots:
-        root_abs = os.path.abspath(root)
-        if not os.path.isdir(root_abs):
-            continue
-        for path in glob.glob(os.path.join(root_abs, "CIK*.json")):
-            if path not in seen:
-                seen.add(path)
-                candidates.append(path)
-
-    print(f"[DEBUG] Search roots tried: {search_roots}")
-    print(f"[DEBUG] Found {len(candidates)} JSON files")
-    if candidates[:5]:
-        print("[DEBUG] Sample files:", [os.path.relpath(p) for p in candidates[:5]])
-    return candidates
-
-def load_ticker_map(tickers_path: str) -> Dict[str, str]:
-    if not tickers_path or not os.path.exists(tickers_path):
-        print(f"[WARN] Tickers file not found: {tickers_path!r}")
-        return {}
-    try:
-        with open(tickers_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"[WARN] Failed to parse tickers JSON: {e}")
-        return {}
-
-    cik2ticker: Dict[str, str] = {}
-    if isinstance(data, dict):
-        values_iter = data.values()
-    elif isinstance(data, list):
-        values_iter = data
+def load_ticker_map(tickers_path: str):
+    with open(tickers_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    # Shapes:
+    #  A) {"0":{"cik_str":1045810,"ticker":"NVDA","title":"NVIDIA CORP"}, ...}
+    #  B) [{"cik_str":..., "ticker":...}, ...]
+    tmap = {}
+    if isinstance(raw, dict):
+        for _, rec in raw.items():
+            if not isinstance(rec, dict):
+                continue
+            cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
+            tic = str(rec.get("ticker") or "").strip().upper()
+            if not cik or not tic:
+                continue
+            cik10 = ("0000000000"+ "".join([c for c in cik if c.isdigit()]))[-10:]
+            tmap[cik10] = tic
+    elif isinstance(raw, list):
+        for rec in raw:
+            cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
+            tic = str(rec.get("ticker") or "").strip().upper()
+            if not cik or not tic:
+                continue
+            cik10 = ("0000000000"+ "".join([c for c in cik if c.isdigit()]))[-10:]
+            tmap[cik10] = tic
     else:
-        print("[WARN] Unexpected tickers JSON shape; expected dict or list.")
-        return {}
+        # unknown shape; return empty
+        pass
+    return tmap
 
-    for rec in values_iter:
-        if not isinstance(rec, dict):
-            continue
-        cik_raw = rec.get("cik_str")
-        ticker = (rec.get("ticker") or "").strip().upper()
-        if not cik_raw or not ticker:
-            continue
-        cik10 = pad_cik10(cik_raw)
-        if cik10:
-            cik2ticker[cik10] = ticker
+def iter_companyfacts_files(root: str):
+    # accept cf/ or cf/companyfacts/, walk recursively to be robust
+    pattern = os.path.join(root, "**", "CIK*.json")
+    for path in glob.iglob(pattern, recursive=True):
+        if os.path.isfile(path):
+            yield path
 
-    print(f"[DEBUG] Ticker map entries={len(cik2ticker)}")
-    return cik2ticker
-
-def extract_rows_from_file(path: str, ticker_map: Dict[str, str]) -> List[dict]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            j = json.load(f)
-    except Exception as e:
-        print(f"[WARN] Failed to parse {os.path.relpath(path)}: {e}")
+def extract_series(j: dict):
+    # Prefer dei.EntityCommonStockSharesOutstanding; fallback to us-gaap.CommonStockSharesOutstanding
+    facts = j.get("facts") or {}
+    series = None
+    candidates = [
+        ("dei", "EntityCommonStockSharesOutstanding"),
+        ("us-gaap", "CommonStockSharesOutstanding"),
+    ]
+    for ns, key in candidates:
+        nsobj = facts.get(ns) or {}
+        node = nsobj.get(key)
+        if node and isinstance(node, dict) and "units" in node:
+            series = node["units"]
+            break
+    if not series:
         return []
 
-    m = re.search(r"CIK(\d+)\.json$", os.path.basename(path))
-    cik_file = pad_cik10(m.group(1)) if m else ""
-    cik_json = pad_cik10(j.get("cik"))
-    cik = cik_json or cik_file
-
-    ticker_json = (j.get("ticker") or "").strip().upper()
-    ticker = ticker_json or (ticker_map.get(cik, "") if cik else "")
-
-    facts = j.get("facts", {}) if isinstance(j, dict) else {}
-    dei = facts.get("dei", {}) if isinstance(facts, dict) else {}
-    gaap = facts.get("us-gaap", {}) if isinstance(facts, dict) else {}
-
-    out = []
-    candidates = []
-    if isinstance(dei.get("EntityCommonStockSharesOutstanding"), dict):
-        candidates.append(dei["EntityCommonStockSharesOutstanding"])
-    if isinstance(gaap.get("CommonStockSharesOutstanding"), dict):
-        candidates.append(gaap["CommonStockSharesOutstanding"])
-
-    for fact in candidates:
-        units = fact.get("units", {}) if isinstance(fact, dict) else {}
-        for unit, arr in units.items():
-            if not isinstance(arr, list):
+    rows = []
+    for unit_key, arr in series.items():
+        if not is_share_unit(unit_key):
+            continue
+        if not isinstance(arr, list):
+            continue
+        for rec in arr:
+            # rec: {"start": "...", "end": "YYYY-MM-DD", "val": number, "form": "...", ...}
+            end = rec.get("end") or rec.get("instant") or ""
+            try:
+                val = float(rec.get("val"))
+            except Exception:
                 continue
-            for rec in arr:
-                if not isinstance(rec, dict):
-                    continue
-                val = rec.get("val")
-                end = rec.get("end")
-                if isinstance(val, (int, float)) and end:
-                    if not ticker:
-                        # skip rows without a ticker (keeps downstream join simple)
-                        continue
-                    out.append({
-                        "symbol": ticker,
-                        "cik": cik,
-                        "shares_outstanding": val,
-                        "shares_asof": end,
-                        "source": "sec_companyfacts",
-                        "fetch_ts": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    })
-    return out
+            if not end:
+                continue
+            rows.append((end, val))
+    return rows
 
 def main():
-    cf_dir = sys.argv[1] if len(sys.argv) > 1 else "."
-    tickers_json = sys.argv[2] if len(sys.argv) > 2 else ""
-    out_dir = sys.argv[3] if len(sys.argv) > 3 else "."
+    if len(sys.argv) != 4:
+        print("Usage: python3 extract_shares.py <companyfacts_root> <tickers.json> <out_dir>")
+        sys.exit(2)
+
+    cf_root, tickers_path, out_dir = sys.argv[1], sys.argv[2], sys.argv[3]
     os.makedirs(out_dir, exist_ok=True)
 
-    out_jsonl = os.path.join(out_dir, "latest-shares.jsonl")
-    out_csv   = os.path.join(out_dir, "latest-by-symbol.csv")
-    out_json  = os.path.join(out_dir, "latest-by-symbol.json")
-    meta_file = os.path.join(out_dir, "meta.json")
+    tmap = load_ticker_map(tickers_path)
+    fetch_ts = utc_date()
 
-    files = find_companyfacts_files(cf_dir)
-    ticker_map = load_ticker_map(tickers_json)
+    files = list(iter_companyfacts_files(cf_root))
+    print(f"[DEBUG] Found {len(files)} JSON files")
+    if files:
+        print("[DEBUG] Sample files:", [os.path.relpath(p, cf_root) for p in files[:5]])
 
-    per_symbol: Dict[str, Tuple[str, float, str]] = {}  # symbol -> (asof, shares, cik)
-    total_files, total_rows = 0, 0
+    jsonl_path = os.path.join(out_dir, "latest-shares.jsonl")
+    csv_path   = os.path.join(out_dir, "latest-by-symbol.csv")
+    meta_path  = os.path.join(out_dir, "meta.json")
 
-    with open(out_jsonl, "w", encoding="utf-8") as fj:
-        for i, path in enumerate(files, 1):
-            rows = extract_rows_from_file(path, ticker_map)
-            total_files += 1
-            for r in rows:
-                fj.write(json.dumps(r) + "\n")
+    # Write JSONL (history) + build latest-per-symbol map
+    total_rows = 0
+    latest_per_cik = {}  # cik10 -> (end, val)
+
+    with open(jsonl_path, "w", encoding="utf-8") as jsonl:
+        for fp in files:
+            fname = os.path.basename(fp)
+            # Extract CIK from filename if possible
+            cik10 = ("".join([c for c in fname if c.isdigit()]))[-10:]
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    j = json.load(f)
+            except Exception:
+                continue
+
+            # Trust embedded CIK if present
+            embedded = str(j.get("cik") or "").strip()
+            if embedded:
+                cik10 = ("0000000000" + "".join([c for c in embedded if c.isdigit()]))[-10:]
+
+            series = extract_series(j)
+            if not series:
+                continue
+
+            # sort by end date ascending and append to JSONL
+            series.sort(key=lambda x: x[0])
+            for end, val in series:
+                rec = {
+                    "symbol": tmap.get(cik10, ""),  # filled later if available
+                    "cik": cik10,
+                    "shares_outstanding": val,
+                    "shares_asof": end,
+                    "source": "sec_companyfacts",
+                    "fetch_ts": fetch_ts,
+                }
+                jsonl.write(json.dumps(rec) + "\n")
                 total_rows += 1
-                sym = r["symbol"]
-                asof = r["shares_asof"]
-                shares = float(r["shares_outstanding"])
-                cik = r["cik"]
-                best = per_symbol.get(sym)
-                if (best is None) or (asof > best[0]):
-                    per_symbol[sym] = (asof, shares, cik)
-            if i % 1000 == 0:
-                print(f"[INFO] Processed {i}/{len(files)} files... rows_so_far={total_rows}, unique_symbols={len(per_symbol)}")
 
-    # Write compact snapshots
-    symbols_sorted = sorted(per_symbol.keys())
-    with open(out_csv, "w", encoding="utf-8") as fc:
-        fc.write("symbol,cik,shares_outstanding,shares_asof,source,fetch_ts\n")
-        for sym in symbols_sorted:
-            asof, shares, cik = per_symbol[sym]
-            fc.write(f"{sym},{cik},{shares},{asof},sec_companyfacts,{datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n")
+            # latest entry
+            end, val = series[-1]
+            cur = latest_per_cik.get(cik10)
+            if (not cur) or (end > cur[0]):
+                latest_per_cik[cik10] = (end, val)
 
-    with open(out_json, "w", encoding="utf-8") as fj2:
-        json.dump(
-            {sym: {"cik": per_symbol[sym][2],
-                   "shares_outstanding": per_symbol[sym][1],
-                   "shares_asof": per_symbol[sym][0]}
-             for sym in symbols_sorted},
-            fj2)
+    # Write latest-by-symbol.csv
+    # Header
+    with open(csv_path, "w", encoding="utf-8") as csvf:
+        csvf.write("symbol,cik,shares_outstanding,shares_asof,source,fetch_ts\n")
+        emitted = 0
+        for cik10, (end, val) in latest_per_cik.items():
+            sym = tmap.get(cik10, "")
+            # Only emit if we have a symbol map; some issuers may be private / no ticker
+            if not sym:
+                continue
+            line = f"{sym},{cik10},{val},{end},sec_companyfacts,{fetch_ts}\n"
+            csvf.write(line)
+            emitted += 1
 
     meta = {
         "source_zip": "https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip",
         "tickers_source": "https://www.sec.gov/files/company_tickers.json",
-        "companies_scanned": total_files,
+        "companies_scanned": len(files),
         "rows_written": total_rows,
-        "symbols_emitted": len(per_symbol),
-        "generated_utc": datetime.now(timezone.utc).isoformat()
+        "symbols_emitted": len(latest_per_cik),
+        "generated_utc": dt.now(datetime.UTC).isoformat(),
     }
-    with open(meta_file, "w", encoding="utf-8") as f:
-        json.dump(meta, f)
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        json.dump(meta, mf)
 
-    print(f"[INFO] Finished. Companies scanned={total_files}, rows_written={total_rows}, symbols_emitted={len(per_symbol)}")
-    print(f"[INFO] Outputs:\n  {out_jsonl}\n  {out_csv}\n  {out_json}\n  {meta_file}")
+    print(f"[INFO] Finished. Companies scanned={len(files)}, rows_written={total_rows}")
 
 if __name__ == "__main__":
     main()
