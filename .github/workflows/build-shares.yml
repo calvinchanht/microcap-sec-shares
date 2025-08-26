@@ -1,7 +1,6 @@
-# build-shares.yml — v1.3.0
-# - Fix: add SEC-compliant User-Agent to curl for companyfacts.zip and tickers.json
-# - Adds: strong validation (MIME/zip test), clearer debug, tolerant paths
-# - Schedule: daily run + monthly heartbeat commit to keep schedules alive
+# build-shares.yml — v1.4.0
+# - No functional change to workflow; extractor now outputs SIC fields
+# - Keeps daily schedule + monthly heartbeat commit
 
 name: Build SEC Shares
 
@@ -12,11 +11,11 @@ on:
     - cron: "0 3 1 * *"    # monthly heartbeat commit on the 1st at 03:00 UTC
 
 env:
-  UA: "Mozilla/5.0 MicroCap microcap@gmail.com"   # <-- use your descriptive UA (email/domain)
+  UA: "Mozilla/5.0 MicroCap microcap@gmail.com"   # <-- your descriptive UA (email/domain)
 
 jobs:
   build:
-    if: github.event.schedule != '0 3 1 * *'   # skip build job during heartbeat
+    if: github.event.schedule != '0 3 1 * *'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -40,16 +39,13 @@ jobs:
           echo "[DEBUG] File(1):"; file -b companyfacts.zip || true
           echo "[DEBUG] Size  (bytes):"; stat -c%s companyfacts.zip || stat -f%z companyfacts.zip || true
 
-          # Quick sanity: must not be HTML/text, and must be a valid zip
           if file companyfacts.zip | grep -iE 'HTML|ASCII|text' >/dev/null 2>&1; then
-            echo "[ERROR] Downloaded content looks like HTML/text (probably an error page). First 60 lines follow:"
+            echo "[ERROR] Downloaded content looks like HTML/text. First 60 lines:"
             head -n 60 companyfacts.zip || true
             exit 1
           fi
-
-          # Validate it's a real zip
           if ! unzip -tq companyfacts.zip >/dev/null 2>&1; then
-            echo "[ERROR] Zip integrity test failed. First 60 lines follow:"
+            echo "[ERROR] Zip integrity test failed. First 60 lines:"
             head -n 60 companyfacts.zip || true
             exit 1
           fi
@@ -73,7 +69,6 @@ jobs:
                -H "Accept-Encoding: identity" \
                -o tickers.json \
                https://www.sec.gov/files/company_tickers.json
-          # quick peek to ensure JSON isn’t an HTML error
           if head -n1 tickers.json | grep -i '<!DOCTYPE' >/dev/null 2>&1; then
             echo "[ERROR] Tickers JSON looks like HTML. First 60 lines:"
             head -n 60 tickers.json
@@ -103,7 +98,6 @@ jobs:
           path: public
 
   heartbeat:
-    # Only run the heartbeat commit on the monthly schedule; otherwise skip
     if: github.event.schedule == '0 3 1 * *'
     runs-on: ubuntu-latest
     steps:
