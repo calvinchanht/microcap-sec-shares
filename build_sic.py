@@ -22,7 +22,7 @@ import urllib.error as urlerr
 from datetime import datetime, timezone
 
 UA = os.environ.get("UA", "Mozilla/5.0 MicroCap microcap@gmail.com")
-SEC_BASE = os.environ.get("SEC_SIC_PROXY_BASE", "https://microcapsec.calvinchanht.workers.dev/sec")  # prefer your Worker /sec
+SEC_BASE = os.environ.get("SEC_SIC_PROXY_BASE", "https://microcapsec.calvinchanht.workers.dev/")  # prefer your Worker /sec
 
 # ---------- helpers ----------
 def utc_now_iso():
