@@ -1,4 +1,9 @@
-# build_sic.py — v1.0.0
+# build_sic.py — v1.1.0
+# Changes:
+# - FIX: Robust header parsing for otherlisted.txt (uses "ACT Symbol", "Security Name", etc.)
+# - Tolerant header lookup (case-insensitive, multiple synonyms)
+# - Small debug prints to help diagnose input shape quickly
+#
 # Purpose:
 #   Fetch SIC for *eligible* listed tickers (same filter as fetchListingsFast v2)
 #   and publish: public/latest-sic-by-symbol.csv + public/sic-meta.json
@@ -13,7 +18,7 @@
 #
 # Output files:
 #   public/latest-sic-by-symbol.csv   (symbol,cik,sic,sic_desc,source,fetch_ts)
-#   public/sic-meta.json              (counters and timestamps)
+#   public/sic-meta.json              (counters & timestamps)
 #
 # Required env:
 #   UA = descriptive "User-Agent" (e.g., 'Mozilla/5.0 MicroCap you@example.com')
@@ -51,6 +56,25 @@ def is_excluded(name: str, symbol: str) -> bool:
         return True
     return False
 
+# ----- helpers -----
+
+def split_header(line: str):
+    return [h.strip() for h in line.split("|")]
+
+def split_row(line: str):
+    return [c.strip() for c in line.split("|")]
+
+def make_idx(header_cells):
+    return {h.lower(): i for i, h in enumerate(header_cells)}
+
+def pick_idx(idx_map, *synonyms):
+    # idx_map has lowercased header -> index
+    for name in synonyms:
+        k = name.lower()
+        if k in idx_map:
+            return idx_map[k]
+    return None
+
 # ----- Parse listings -----
 
 def parse_nasdaq_listed(path: str):
@@ -58,44 +82,75 @@ def parse_nasdaq_listed(path: str):
     out = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         lines = [ln.strip() for ln in f if ln.strip()]
-    hdr = [h.strip() for h in lines[0].split("|")]
-    idx = {h:i for i,h in enumerate(hdr)}
-    for ln in lines[1:]:
-        if ln.startswith("File Creation Time"):  # trailer
-            break
-        c = ln.split("|")
-        sym = c[idx["Symbol"]].strip()
-        name = c[idx["Security Name"]].strip()
-        is_test = (c[idx["Test Issue"]] == "Y")
-        is_etf  = (c[idx["ETF"]] == "Y")
-        exchange = "Nasdaq"
-        if not sym or not name: 
-            continue
-        out.append({"symbol": sym, "name": name, "exchange": exchange, "is_test": is_test, "is_etf": is_etf})
-    return out
+    hdr = split_header(lines[0])
+    idx = make_idx(hdr)
 
-def parse_other_listed(path: str):
-    # otherlisted.txt: pipe-delimited; last line is 'File Creation Time'
-    # Exchange codes: N=NYSE, A=NYSE American, P=NYSE Arca
-    code_map = {"N": "NYSE", "A": "NYSE American", "P": "NYSE Arca"}
-    out = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    hdr = [h.strip() for h in lines[0].split("|")]
-    idx = {h:i for i,h in enumerate(hdr)}
+    i_sym  = pick_idx(idx, "Symbol")
+    i_name = pick_idx(idx, "Security Name")
+    i_test = pick_idx(idx, "Test Issue")
+    i_etf  = pick_idx(idx, "ETF")
+
+    if None in (i_sym, i_name, i_test, i_etf):
+        print("[ERROR] Unexpected nasdaqlisted.txt headers:", hdr)
+        raise KeyError("nasdaqlisted.txt header mismatch")
+
     for ln in lines[1:]:
         if ln.startswith("File Creation Time"):
             break
-        c = ln.split("|")
-        sym = c[idx["Symbol"]].strip()
-        exch_code = c[idx["Exchange"]].strip()
-        name = c[idx["Name"]].strip()
-        is_etf  = (c[idx["ETF"]] == "Y")
-        is_test = (c[idx["Test Issue"]] == "Y")
+        c = split_row(ln)
+        if len(c) < len(hdr):
+            continue
+        sym = c[i_sym]
+        name = c[i_name]
+        is_test = (c[i_test] == "Y")
+        is_etf  = (c[i_etf]  == "Y")
+        exchange = "Nasdaq"
+        if not sym or not name:
+            continue
+        out.append({"symbol": sym, "name": name, "exchange": exchange, "is_test": is_test, "is_etf": is_etf})
+    print(f"[DEBUG] parse_nasdaq_listed: rows={len(out)}")
+    return out
+
+def parse_other_listed(path: str):
+    """
+    otherlisted.txt headers typically:
+    ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
+    """
+    code_map = {"N": "NYSE", "A": "NYSE American", "P": "NYSE Arca"}
+
+    out = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    hdr = split_header(lines[0])
+    idx = make_idx(hdr)
+
+    # Flexible header resolution
+    i_sym  = pick_idx(idx, "ACT Symbol", "Symbol", "CQS Symbol", "NASDAQ Symbol")
+    i_name = pick_idx(idx, "Security Name", "Name")
+    i_exch = pick_idx(idx, "Exchange")
+    i_etf  = pick_idx(idx, "ETF")
+    i_test = pick_idx(idx, "Test Issue")
+
+    if None in (i_sym, i_name, i_exch, i_etf, i_test):
+        print("[ERROR] Unexpected otherlisted.txt headers:", hdr)
+        raise KeyError("otherlisted.txt header mismatch")
+
+    for ln in lines[1:]:
+        if ln.startswith("File Creation Time"):
+            break
+        c = split_row(ln)
+        if len(c) < len(hdr):
+            continue
+        sym = c[i_sym]
+        name = c[i_name]
+        exch_code = c[i_exch]
+        is_etf  = (c[i_etf]  == "Y")
+        is_test = (c[i_test] == "Y")
         exchange = code_map.get(exch_code, "")
         if not sym or not name or not exchange:
             continue
         out.append({"symbol": sym, "name": name, "exchange": exchange, "is_test": is_test, "is_etf": is_etf})
+    print(f"[DEBUG] parse_other_listed: rows={len(out)}")
     return out
 
 def filtered_eligible(nas_rows, oth_rows):
@@ -118,6 +173,7 @@ def filtered_eligible(nas_rows, oth_rows):
             continue
         seen.add(u)
         out.append(r)
+    print(f"[DEBUG] filtered_eligible: before={len(base)} after={len(out)}")
     return out
 
 # ----- SEC tickers mapping -----
@@ -133,7 +189,7 @@ def load_tickers_map(tickers_json_path: str):
                 continue
             cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
             tic = str(rec.get("ticker") or "").strip().upper()
-            if not cik or not tic: 
+            if not cik or not tic:
                 continue
             cik10 = ("0000000000" + "".join(ch for ch in cik if ch.isdigit()))[-10:]
             t2c[tic] = cik10
@@ -141,10 +197,11 @@ def load_tickers_map(tickers_json_path: str):
         for rec in raw:
             cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
             tic = str(rec.get("ticker") or "").strip().upper()
-            if not cik or not tic: 
+            if not cik or not tic:
                 continue
             cik10 = ("0000000000" + "".join(ch for ch in cik if ch.isdigit()))[-10:]
             t2c[tic] = cik10
+    print(f"[DEBUG] load_tickers_map: size={len(t2c)}")
     return t2c
 
 # ----- SEC fetch with throttle -----
@@ -159,7 +216,6 @@ def http_get_json(url: str, ua: str, tries=3, backoff=2.0):
         try:
             with urlopen(req, timeout=30) as resp:
                 data = resp.read()
-                # Python handles gzip automatically if Accept-Encoding present; fallback json decode
                 return json.loads(data.decode("utf-8", errors="ignore"))
         except HTTPError as e:
             last = e
@@ -193,6 +249,7 @@ def main():
     ua = os.environ.get("UA", "").strip() or "Mozilla/5.0 MicroCap (contact@example.com)"
     os.makedirs(out_dir, exist_ok=True)
 
+    print("[INFO] Reading NasdaqTrader lists…")
     nas = parse_nasdaq_listed(nasdaq_path)
     oth = parse_other_listed(other_path)
     elig = filtered_eligible(nas, oth)
@@ -219,6 +276,8 @@ def main():
             continue
         seen_sym.add(sym)
         uniq_pairs.append((sym, cik))
+
+    print(f"[INFO] Eligible={len(elig)} pairs_with_cik={len(uniq_pairs)} (missing_cik={len(missing_cik)})")
 
     # Throttled fetch
     per_sec = 8.0
@@ -264,7 +323,7 @@ def main():
     with open(os.path.join(out_dir, "sic-meta.json"), "w", encoding="utf-8") as mf:
         json.dump(meta, mf)
 
-    print(f"[INFO] SIC done. eligible={len(elig)} with_cik={len(uniq_pairs)} rows={len(rows)} miss_cik={len(missing_cik)}")
+    print(f"[INFO] SIC done. ok={ok} miss={miss} rows={len(rows)}")
 
 if __name__ == "__main__":
     main()
