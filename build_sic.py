@@ -1,236 +1,263 @@
-# build_sic.py — v1.2.0
-# - NEW: Proxy-aware (SIC_PROXY_BASE); default hits data.sec.gov
-# - FIX: robust headers for otherlisted.txt (ACT Symbol, Security Name, etc.)
-# - Better error logging; writes CSV even if empty
-# - Same filter as fetchListingsFast v2 to keep universe lean
+#!/usr/bin/env python3
+# build_sic.py — v1.3.0
+# Robust SIC fetcher via Cloudflare Worker
+# - Headers: explicit UA/Accept/Accept-Encoding(identity)
+# - Retries with backoff; throttles ~7–8 req/s
+# - Accepts both /sec/submissions/* and /submissions/* via Worker
+# - Writes:
+#     public/latest-sic-by-symbol.csv
+#     public/sic-meta.json
+#
+# Usage:
+#   python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
+#
+# Env:
+#   UA= "Mozilla/5.0 MicroCap you@domain"
+#   SEC_SIC_PROXY_BASE="https://<your-worker>.workers.dev/sec"    # recommended
+#   (If SEC_SIC_PROXY_BASE is unset, defaults to https://www.sec.gov (less reliable from CI))
 
-import csv, json, os, re, sys, time
+import csv, os, sys, json, time, gzip, io
+import urllib.request as urlreq
+import urllib.error as urlerr
 from datetime import datetime, timezone
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 
-ALLOWED_EXCH = {"Nasdaq", "NYSE", "NYSE American"}
+UA = os.environ.get("UA", "Mozilla/5.0 MicroCap (contact@example.com)")
+SEC_BASE = os.environ.get("SEC_SIC_PROXY_BASE", "https://www.sec.gov")  # prefer your Worker /sec
 
-EXCLUDE_NAME_PATTERNS = re.compile(
-    r"(ETF|ETNs?|Closed[-\s]?End|CEF|Unit(s)?\b|Warrant(s)?\b|Right(s)?\b|"
-    r"Preferred( Stock)?|Preference|Trust\b|Limited Partnership| L\.P\.|\bLP\b|"
-    r"Notes?\b|Baby Bond|Senior Notes?|Subordinated Notes?|Perpetual Note|Note )",
-    re.IGNORECASE,
-)
-EXCLUDE_SYMBOL_SUFFIX = re.compile(r"[-\.](WS|W|WT|RT|U|P|PR|[A-Z]\d?)$", re.IGNORECASE)
+# ---------- helpers ----------
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-def is_excluded(name: str, symbol: str) -> bool:
-    n = name or ""
-    s = symbol or ""
-    if EXCLUDE_NAME_PATTERNS.search(n):
-        if re.search(r"American Depositary Shares?", n, re.IGNORECASE) and not re.search(r"Preferred|Notes?", n, re.IGNORECASE):
-            pass
-        else:
-            return True
-    if EXCLUDE_SYMBOL_SUFFIX.search(s):
-        return True
-    return False
+def norm_ticker(s):
+    return (s or "").strip().upper().replace(" ", "").replace(".", "-")
 
-def split_header(line): return [h.strip() for h in line.split("|")]
-def split_row(line):    return [c.strip() for c in line.split("|")]
-def make_idx(header):   return {h.lower(): i for i, h in enumerate(header)}
-def pick_idx(idx_map, *syn): 
-    for s in syn:
-        k = s.lower()
-        if k in idx_map: return idx_map[k]
-    return None
-
-def parse_nasdaq_listed(path):
-    out = []
+def parse_pipe_file(path):
+    """Return (header:list, rows:list[list]) for a '|' separated file."""
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         lines = [ln.strip() for ln in f if ln.strip()]
-    hdr = split_header(lines[0]); idx = make_idx(hdr)
-    i_sym  = pick_idx(idx, "Symbol")
-    i_name = pick_idx(idx, "Security Name")
-    i_test = pick_idx(idx, "Test Issue")
-    i_etf  = pick_idx(idx, "ETF")
-    if None in (i_sym, i_name, i_test, i_etf):
-        print("[ERROR] nasdaqlisted headers:", hdr); raise KeyError("nasdaqlisted.txt header mismatch")
-    for ln in lines[1:]:
-        if ln.startswith("File Creation Time"): break
-        c = split_row(ln)
-        if len(c) < len(hdr): continue
-        out.append({
-            "symbol": c[i_sym], "name": c[i_name], "exchange": "Nasdaq",
-            "is_test": (c[i_test] == "Y"), "is_etf": (c[i_etf] == "Y")
-        })
-    print(f"[DEBUG] parse_nasdaq_listed: rows={len(out)}")
+    header = lines[0].split("|")
+    rows = [ln.split("|") for ln in lines[1:] if not ln.startswith("File Creation Time")]
+    return header, rows
+
+def parse_nasdaq_listed(path):
+    hdr, rows = parse_pipe_file(path)
+    idx = {h:i for i,h in enumerate(hdr)}
+    out = []
+    for c in rows:
+        try:
+            sym = c[idx["Symbol"]].strip()
+            name = c[idx["Security Name"]].strip()
+            test = c[idx["Test Issue"]].strip().upper() == "Y"
+            etf  = c[idx["ETF"]].strip().upper() == "Y"
+        except KeyError:
+            # Unexpected header; skip row
+            continue
+        out.append({"symbol": sym, "name": name, "exchange": "Nasdaq", "is_test": test, "is_etf": etf})
     return out
 
 def parse_other_listed(path):
-    code_map = {"N": "NYSE", "A": "NYSE American", "P": "NYSE Arca"}
+    hdr, rows = parse_pipe_file(path)
+    idx = {h:i for i,h in enumerate(hdr)}
     out = []
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    hdr = split_header(lines[0]); idx = make_idx(hdr)
-    i_sym  = pick_idx(idx, "ACT Symbol", "Symbol", "CQS Symbol", "NASDAQ Symbol")
-    i_name = pick_idx(idx, "Security Name", "Name")
-    i_exch = pick_idx(idx, "Exchange")
-    i_etf  = pick_idx(idx, "ETF")
-    i_test = pick_idx(idx, "Test Issue")
-    if None in (i_sym, i_name, i_exch, i_etf, i_test):
-        print("[ERROR] otherlisted headers:", hdr); raise KeyError("otherlisted.txt header mismatch")
-    for ln in lines[1:]:
-        if ln.startswith("File Creation Time"): break
-        c = split_row(ln)
-        if len(c) < len(hdr): continue
-        exch = code_map.get(c[i_exch], "")
-        if not exch: continue
-        out.append({
-            "symbol": c[i_sym], "name": c[i_name], "exchange": exch,
-            "is_test": (c[i_test] == "Y"), "is_etf": (c[i_etf] == "Y")
-        })
-    print(f"[DEBUG] parse_other_listed: rows={len(out)}")
+    for c in rows:
+        try:
+            sym = c[idx["ACT Symbol"]].strip() if "ACT Symbol" in idx else c[idx["Symbol"]].strip()
+            name = c[idx["Security Name"]].strip()
+            exchCode = c[idx["Exchange"]].strip() if "Exchange" in idx else ""
+            etf  = c[idx["ETF"]].strip().upper() == "Y"
+            test = c[idx["Test Issue"]].strip().upper() == "Y"
+        except KeyError:
+            continue
+        exch = "NYSE" if exchCode == "N" else "NYSE American" if exchCode == "A" else "NYSE Arca" if exchCode=="P" else ""
+        out.append({"symbol": sym, "name": name, "exchange": exch, "is_test": test, "is_etf": etf})
     return out
 
+def looks_like_rwu(symbol, name):
+    if not symbol and not name: return False
+    if symbol and any(symbol.upper().endswith(suf) for suf in ("-W", "-WS", "-WT", "-RT", "-U")):
+        return True
+    if name and any(tok in name.upper() for tok in (" WARRANT", " RIGHT", " UNIT", " UNITS", " WTS", " WT ")):
+        return True
+    return False
+
+def looks_like_pref_trust_lp(symbol, name):
+    txt = f"{symbol} {name}".upper()
+    # crude filters for prefs/trusts/LPs (reduce noise)
+    bad = (" PFD ", " PREFER", " TR ", " TRUST", " DEPOSITARY SHARE", " LP ", " L.P.", " LIMITED PARTNERSHIP", "NOTE DUE")
+    return any(b in txt for b in bad)
+
+def looks_like_adr(name):
+    if not name: return False
+    up = name.upper()
+    return " ADR " in up or up.endswith(" ADR") or "DEPOSITARY SH" in up or "AMERICAN DEPOS" in up
+
 def filtered_eligible(nas, oth):
-    base = nas + oth
-    elig = []
+    base = nas + [r for r in oth if r["exchange"] in ("NYSE","NYSE American")]
+    keep = []
     for r in base:
-        if r["exchange"] not in ALLOWED_EXCH: continue
-        if r["is_etf"] or r["is_test"]:       continue
-        if is_excluded(r["name"], r["symbol"]): continue
-        elig.append(r)
-    seen, out = set(), []
-    for r in elig:
-        u = r["symbol"].upper()
-        if u in seen: continue
-        seen.add(u); out.append(r)
-    print(f"[DEBUG] filtered_eligible: before={len(base)} after={len(out)}")
-    return out
+        if r["exchange"] not in ("Nasdaq","NYSE","NYSE American"): continue
+        if r["is_test"] or r["is_etf"]: continue
+        if looks_like_rwu(r["symbol"], r["name"]): continue
+        if looks_like_pref_trust_lp(r["symbol"], r["name"]): continue
+        if looks_like_adr(r["name"]): continue
+        keep.append(r)
+    return keep
 
 def load_tickers_map(tickers_json_path):
     with open(tickers_json_path, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    t2c = {}
+    tmap = {}  # cik10 -> ticker
     if isinstance(raw, dict):
+        # {"0":{"cik_str":..., "ticker":...}, ...}
         for _, rec in raw.items():
             if not isinstance(rec, dict): continue
             cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
-            tic = str(rec.get("ticker") or "").strip().upper()
+            tic = norm_ticker(rec.get("ticker"))
             if not cik or not tic: continue
             cik10 = ("0000000000" + "".join(ch for ch in cik if ch.isdigit()))[-10:]
-            t2c[tic] = cik10
+            tmap[cik10] = tic
     elif isinstance(raw, list):
         for rec in raw:
             cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
-            tic = str(rec.get("ticker") or "").strip().upper()
+            tic = norm_ticker(rec.get("ticker"))
             if not cik or not tic: continue
             cik10 = ("0000000000" + "".join(ch for ch in cik if ch.isdigit()))[-10:]
-            t2c[tic] = cik10
-    print(f"[DEBUG] load_tickers_map: size={len(t2c)}")
-    return t2c
+            tmap[cik10] = tic
+    return tmap
 
-def base_url():
-    b = os.environ.get("SIC_PROXY_BASE", "").strip()
-    if b:
-        return b.rstrip("/")
-    return "https://data.sec.gov"
+def request_json(url, timeout=20):
+    """GET JSON with strict headers, identity encoding, return parsed or raise."""
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",  # avoid gzip/br to simplify
+        "Connection": "close",
+    }
+    req = urlreq.Request(url, headers=headers, method="GET")
+    with urlreq.urlopen(req, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise urlerr.HTTPError(url, resp.status, f"HTTP {resp.status}", hdrs=resp.headers, fp=None)
+        raw = resp.read()
+        if not raw:
+            raise ValueError("empty body")
+        # Assume utf-8
+        text = raw.decode("utf-8", errors="replace")
+        return json.loads(text)
 
-def http_get_json(url, ua, tries=4, backoff=1.5):
-    last = None
-    for i in range(tries):
-        try:
-            req = Request(url, headers={"User-Agent": ua, "Accept-Encoding": "gzip, deflate"})
-            with urlopen(req, timeout=30) as resp:
-                data = resp.read()
-                return json.loads(data.decode("utf-8", errors="ignore"))
-        except HTTPError as e:
-            last = e
-            code = getattr(e, "code", 0)
-            print(f"[WARN] HTTP {code} for {url} (try {i+1}/{tries})")
-            if code in (429, 500, 502, 503, 504):
-                time.sleep(backoff * (i+1)); continue
-            break
-        except URLError as e:
-            last = e
-            print(f"[WARN] URLError for {url}: {e} (try {i+1}/{tries})")
-            time.sleep(backoff * (i+1))
-    if last: raise last
-    raise RuntimeError("http_get_json unknown failure")
+def fetch_submissions_json(cik10, base):
+    """Try both /sec/submissions and /submissions paths against the proxy base."""
+    paths = [
+        f"{base.rstrip('/')}/submissions/CIK{cik10}.json",      # if base already ends with /sec
+        f"{base.rstrip('/')}/sec/submissions/CIK{cik10}.json",  # in case base is just the worker root
+    ]
+    last_err = None
+    for attempt in range(1, 5):  # up to 4 tries with backoff
+        for u in paths:
+            try:
+                return request_json(u)
+            except urlerr.HTTPError as he:
+                # Bubble up 403/404 after retries; log as warn
+                last_err = he
+            except Exception as e:
+                last_err = e
+        # simple backoff
+        time.sleep(0.5 * attempt)
+    if last_err: raise last_err
+    raise RuntimeError("failed to fetch submissions json")
 
-def fetch_sic_for_cik(cik10, ua):
-    # If using Worker (…/sec), keep path after /sec identical to SEC.
-    url = f"{base_url()}/submissions/CIK{cik10}.json"
-    j = http_get_json(url, ua)
-    return str(j.get("sic") or "").strip(), str(j.get("sicDescription") or "").strip()
-
+# ---------- main ----------
 def main():
     if len(sys.argv) != 5:
-        print("Usage: python3 build_sic.py nasdaqlisted.txt otherlisted.txt company_tickers.json out_dir")
+        print("Usage: python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public")
         sys.exit(2)
 
-    nasdaq_path, other_path, tickers_path, out_dir = sys.argv[1:]
-    ua = os.environ.get("UA", "").strip() or "Mozilla/5.0 MicroCap (contact@example.com)"
+    nasdaq_path, other_path, tickers_path, out_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     os.makedirs(out_dir, exist_ok=True)
 
     print("[INFO] Reading NasdaqTrader lists…")
     nas = parse_nasdaq_listed(nasdaq_path)
     oth = parse_other_listed(other_path)
-    elig = filtered_eligible(nas, oth)
+    print(f"[DEBUG] parse_nasdaq_listed: rows={len(nas)}")
+    print(f"[DEBUG] parse_other_listed: rows={len(oth)}")
 
-    t2c = load_tickers_map(tickers_path)
-    fetch_ts = datetime.now(timezone.utc).date().isoformat()
+    eligible = filtered_eligible(nas, oth)
+    print(f"[DEBUG] filtered_eligible: before={len(nas)+len(oth)} after={len(eligible)}")
 
-    pairs, missing = [], []
-    for r in elig:
-        sym = r["symbol"].upper()
-        cik10 = t2c.get(sym, "")
-        if not cik10: missing.append(sym); continue
-        if not re.fullmatch(r"\d{10}", cik10): continue
-        pairs.append((sym, cik10))
+    cik_to_ticker = load_tickers_map(tickers_path)
+    print(f"[DEBUG] load_tickers_map: size={len(cik_to_ticker)}")
 
-    seen_sym, uniq = set(), []
-    for sym, cik in pairs:
-        if sym in seen_sym: continue
-        seen_sym.add(sym); uniq.append((sym, cik))
+    # Build ticker->cik map for eligible set
+    pairs = []
+    missing = 0
+    for r in eligible:
+        sym = norm_ticker(r["symbol"])
+        # invert map: cik map is cik10->ticker, so search by value is O(1) if we prebuild
+        # but we only need cik for eligible; build a small lookup
+        # Build once:
+        # (small trick: create a dict ticker->cik for eligible on demand to avoid a 10k scan each loop)
+        # We'll construct a small set of eligible tickers and then backfill cik.
+        pairs.append((sym, None))
+    # build ticker->cik once
+    ticker_to_cik = {tic: cik for cik, tic in cik_to_ticker.items()}
+    fixed_pairs = []
+    for sym, _ in pairs:
+        cik = ticker_to_cik.get(sym)
+        if cik:
+            fixed_pairs.append((sym, cik))
+        else:
+            missing += 1
+    print(f"[INFO] Eligible={len(eligible)} pairs_with_cik={len(fixed_pairs)} missing_cik={missing} via={SEC_BASE}")
 
-    print(f"[INFO] Eligible={len(elig)} pairs_with_cik={len(uniq)} missing_cik={len(missing)} via={base_url()}")
-
-    per_sec = 8.0
-    interval = 1.0 / per_sec
-    rows, ok, miss = [], 0, 0
-    last_t = 0.0
-
-    for i, (sym, cik10) in enumerate(uniq, 1):
-        # throttle
-        now = time.time()
-        dt = now - last_t
-        if dt < interval: time.sleep(interval - dt)
-        last_t = time.time()
-
-        try:
-            sic, desc = fetch_sic_for_cik(cik10, ua)
-            rows.append([sym, cik10, sic, desc, "sec_submissions", fetch_ts])
-            ok += 1
-        except Exception as e:
-            print(f"[WARN] SIC fail {sym} CIK{cik10}: {e}")
-            miss += 1
-
+    # Output files
     out_csv = os.path.join(out_dir, "latest-sic-by-symbol.csv")
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    out_meta = os.path.join(out_dir, "sic-meta.json")
+
+    # Write header early so file always exists
+    with open(out_csv, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["symbol","cik","sic","sic_desc","source","fetch_ts"])
-        w.writerows(rows)
+
+    ok = 0
+    miss = 0
+    wrote = 0
+    start = time.time()
+
+    with open(out_csv, "a", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        for i, (sym, cik10) in enumerate(fixed_pairs, 1):
+            # throttle ~0.13s/request ≈ 7.6 rps
+            time.sleep(0.13)
+            try:
+                j = fetch_submissions_json(cik10, SEC_BASE)
+                sic = str(j.get("sic") or "").strip()
+                desc = (j.get("sicDescription") or j.get("sic_description") or "").strip()
+                if not sic:
+                    miss += 1
+                    print(f"[WARN] No SIC for {sym} CIK{cik10}")
+                    continue
+                w.writerow([sym, cik10, sic, desc, "sec_submissions", datetime.utcnow().date().isoformat()])
+                ok += 1
+                wrote += 1
+            except urlerr.HTTPError as he:
+                miss += 1
+                print(f"[WARN] HTTP {he.code} for {SEC_BASE}/submissions/CIK{cik10}.json (try over): {sym}")
+            except Exception as e:
+                miss += 1
+                print(f"[WARN] SIC fail {sym} CIK{cik10}: {e}")
 
     meta = {
-        "eligible_symbols": len(elig),
-        "pairs_with_cik": len(uniq),
-        "requests_made": len(uniq),
-        "rows_written": len(rows),
-        "missing_cik_symbols": len(missing),
-        "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "via": base_url(),
+        "eligible_symbols": len(eligible),
+        "pairs_with_cik": len(fixed_pairs),
+        "requests_made": ok + miss,
+        "rows_written": wrote,
+        "missing_cik_symbols": missing,
+        "generated_utc": utc_now_iso(),
     }
-    with open(os.path.join(out_dir, "sic-meta.json"), "w", encoding="utf-8") as mf:
+    with open(out_meta, "w", encoding="utf-8") as mf:
         json.dump(meta, mf)
 
-    print(f"[INFO] SIC done. ok={ok} miss={miss} rows={len(rows)}")
+    dur = time.time() - start
+    print(f"[INFO] SIC done. ok={ok} miss={miss} rows={wrote} in {dur:.1f}s")
 
 if __name__ == "__main__":
     main()
