@@ -1,31 +1,35 @@
 # build-shares.yml — v1.4.0
-# - Adds SIC pipeline into the SAME artifact to avoid Pages overwrite
-# - Daily schedule keeps shares fresh; SIC adds ~10–15min at ~8 req/s for ~5.6k names
-# - Monthly heartbeat keeps schedules alive
-#
-# Outputs (in ./public):
-#   latest-shares.jsonl
-#   latest-by-symbol.csv
-#   meta.json
-#   latest-sic-by-symbol.csv
-#   sic-meta.json
+# - FIX: add explicit 'Deploy to GitHub Pages' job (actions/deploy-pages@v4)
+# - Adds env SIC_PROXY_BASE to route SEC submissions via your Worker
+# - Keeps daily build + monthly heartbeat schedule
 
-name: Build SEC Shares + SIC
+name: Build SEC Shares
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 7 * * *"   # daily ~07:17 UTC (shares + SIC)
-    - cron: "0 3 1 * *"    # monthly heartbeat commit only
+    - cron: "17 7 * * *"   # daily ~07:17 UTC
+    - cron: "0 3 1 * *"    # monthly heartbeat commit
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 env:
-  UA: "Mozilla/5.0 MicroCap microcap@gmail.com"   # your descriptive UA (email/domain)
+  UA: "Mozilla/5.0 MicroCap microcap@gmail.com"
+  # Point this at your Worker that proxies SEC endpoints (see Worker code below).
+  # Leave empty to hit data.sec.gov directly (not recommended on GH Actions).
+  SIC_PROXY_BASE: "https://microcapsec.calvinchanht.workers.dev/sec"
 
 jobs:
   build:
-    if: github.event.schedule != '0 3 1 * *'   # skip build during heartbeat
+    if: github.event.schedule != '0 3 1 * *'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +39,7 @@ jobs:
           set -e
           mkdir -p cf public
 
-      - name: Download SEC companyfacts.zip (with UA) + verify
+      - name: Download SEC companyfacts.zip (UA) + verify
         run: |
           set -e
           echo "[INFO] Fetching companyfacts.zip with UA: $UA"
@@ -44,48 +48,29 @@ jobs:
                -H "Accept-Encoding: identity" \
                -o companyfacts.zip \
                https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
-          # Validate zip content
-          if file companyfacts.zip | grep -iE 'HTML|ASCII|text' >/dev/null 2>&1; then
-            echo "[ERROR] Looks like HTML/text (error page). First 60 lines:"
-            head -n 60 companyfacts.zip || true
+          if ! unzip -tq companyfacts.zip >/dev/null 2>&1; then
+            echo "[ERROR] Bad zip (maybe got HTML). First 60 lines:"; head -n 60 companyfacts.zip || true
             exit 1
           fi
-          unzip -tq companyfacts.zip >/dev/null 2>&1 || (echo "[ERROR] Zip integrity test failed" && exit 1)
 
       - name: Unzip companyfacts
         run: |
           set -e
           unzip -q companyfacts.zip -d cf
-          echo "[DEBUG] Count of JSON files under cf:"
-          find cf -type f -name 'CIK*.json' | wc -l
+          echo "[DEBUG] Count of CIK*.json:"; find cf -type f -name 'CIK*.json' | wc -l
 
-      - name: Download SEC tickers (with UA)
+      - name: Download NasdaqTrader lists (UA) + tickers (UA)
         run: |
           set -e
           curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
-               -H "User-Agent: $UA" \
-               -H "Accept-Encoding: identity" \
-               -o tickers.json \
-               https://www.sec.gov/files/company_tickers.json
-          if head -n1 tickers.json | grep -i '<!DOCTYPE' >/dev/null 2>&1; then
-            echo "[ERROR] Tickers JSON looks like HTML. First 60 lines:"
-            head -n 60 tickers.json
-            exit 1
-          fi
-          wc -c tickers.json || true
-
-      - name: Download NasdaqTrader listings (with UA)
-        run: |
-          set -e
+            -H "User-Agent: $UA" -o nasdaqlisted.txt \
+            https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt
           curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
-               -H "User-Agent: $UA" \
-               -o nasdaqlisted.txt \
-               https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt
+            -H "User-Agent: $UA" -o otherlisted.txt \
+            https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt
           curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
-               -H "User-Agent: $UA" \
-               -o otherlisted.txt \
-               https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt
-          wc -l nasdaqlisted.txt otherlisted.txt || true
+            -H "User-Agent: $UA" -H "Accept-Encoding: identity" -o tickers.json \
+            https://www.sec.gov/files/company_tickers.json
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -96,28 +81,34 @@ jobs:
         run: |
           set -e
           python3 extract_shares.py cf tickers.json public
-          echo "[INFO] Shares outputs in ./public:"
-          ls -lh public
-          echo "[INFO] Rows in latest-shares.jsonl:"
-          wc -l public/latest-shares.jsonl || true
-          echo "[INFO] meta.json:"
-          jq '.' public/meta.json
+          echo "[INFO] Shares artifacts:"; ls -lh public
 
-      - name: Build SIC (throttled ~8 req/s)
+      - name: Run SIC builder (proxy via Worker)
         env:
           UA: ${{ env.UA }}
+          SIC_PROXY_BASE: ${{ env.SIC_PROXY_BASE }}
         run: |
           set -e
           python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
-          echo "[INFO] SIC outputs in ./public:"
-          ls -lh public
-          echo "[INFO] sic-meta.json:"
-          jq '.' public/sic-meta.json
+          echo "[INFO] SIC artifacts:"; ls -lh public
+          echo "[INFO] sic-meta.json:"; jq '.' public/sic-meta.json
 
-      - name: Upload Pages artifact (combined)
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
+
+  deploy:
+    if: github.event.schedule != '0 3 1 * *'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
 
   heartbeat:
     if: github.event.schedule == '0 3 1 * *'
@@ -125,7 +116,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Heartbeat commit to keep schedules alive
+      - name: Heartbeat commit
         run: |
           set -e
           git config user.name "github-actions[bot]"
@@ -138,5 +129,5 @@ jobs:
           if git commit -m "automation: heartbeat"; then
             git push origin ${{ github.ref_name }}
           else
-            echo "[INFO] No changes to commit (heartbeat already up to date)."
+            echo "[INFO] No heartbeat change."
           fi
