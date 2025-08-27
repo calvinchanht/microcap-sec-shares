@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# build_sic.py — v1.3.0
+# build_sic.py — v1.4.0
 # Robust SIC fetcher via Cloudflare Worker
 # - Headers: explicit UA/Accept/Accept-Encoding(identity)
-# - Retries with backoff; throttles ~7–8 req/s
+# - Retries with backoff + jitter; gentle throttle (~5–6 rps)
 # - Accepts both /sec/submissions/* and /submissions/* via Worker
 # - Writes:
 #     public/latest-sic-by-symbol.csv
@@ -12,17 +12,21 @@
 #   python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
 #
 # Env:
-#   UA= "Mozilla/5.0 MicroCap you@domain"
-#   SEC_SIC_PROXY_BASE="https://<your-worker>.workers.dev/sec"    # recommended
-#   (If SEC_SIC_PROXY_BASE is unset, defaults to https://www.sec.gov (less reliable from CI))
+#   UA="Mozilla/5.0 MicroCap you@domain"
+#   SEC_SIC_PROXY_BASE="https://<your-worker>.workers.dev/sec"  # preferred
+#   (Alternatively) SIC_PROXY_BASE="https://<your-worker>.workers.dev/sec"
 
-import csv, os, sys, json, time, gzip, io
+import csv, os, sys, json, time, random
 import urllib.request as urlreq
 import urllib.error as urlerr
 from datetime import datetime, timezone
 
 UA = os.environ.get("UA", "Mozilla/5.0 MicroCap microcap@gmail.com")
-SEC_BASE = os.environ.get("SEC_SIC_PROXY_BASE", "https://microcapsec.calvinchanht.workers.dev/")  # prefer your Worker /sec
+SEC_BASE = (
+    os.environ.get("SEC_SIC_PROXY_BASE")
+    or os.environ.get("SIC_PROXY_BASE")
+    or "https://microcapsec.calvinchanht.workers.dev/sec"
+)
 
 # ---------- helpers ----------
 def utc_now_iso():
@@ -50,7 +54,6 @@ def parse_nasdaq_listed(path):
             test = c[idx["Test Issue"]].strip().upper() == "Y"
             etf  = c[idx["ETF"]].strip().upper() == "Y"
         except KeyError:
-            # Unexpected header; skip row
             continue
         out.append({"symbol": sym, "name": name, "exchange": "Nasdaq", "is_test": test, "is_etf": etf})
     return out
@@ -82,7 +85,6 @@ def looks_like_rwu(symbol, name):
 
 def looks_like_pref_trust_lp(symbol, name):
     txt = f"{symbol} {name}".upper()
-    # crude filters for prefs/trusts/LPs (reduce noise)
     bad = (" PFD ", " PREFER", " TR ", " TRUST", " DEPOSITARY SHARE", " LP ", " L.P.", " LIMITED PARTNERSHIP", "NOTE DUE")
     return any(b in txt for b in bad)
 
@@ -108,7 +110,6 @@ def load_tickers_map(tickers_json_path):
         raw = json.load(f)
     tmap = {}  # cik10 -> ticker
     if isinstance(raw, dict):
-        # {"0":{"cik_str":..., "ticker":...}, ...}
         for _, rec in raw.items():
             if not isinstance(rec, dict): continue
             cik = str(rec.get("cik_str") or rec.get("cik") or rec.get("cikStr") or "").strip()
@@ -125,12 +126,12 @@ def load_tickers_map(tickers_json_path):
             tmap[cik10] = tic
     return tmap
 
-def request_json(url, timeout=20):
+def request_json(url, timeout=25):
     """GET JSON with strict headers, identity encoding, return parsed or raise."""
     headers = {
         "User-Agent": UA,
         "Accept": "application/json",
-        "Accept-Encoding": "identity",  # avoid gzip/br to simplify
+        "Accept-Encoding": "identity",
         "Connection": "close",
     }
     req = urlreq.Request(url, headers=headers, method="GET")
@@ -140,28 +141,31 @@ def request_json(url, timeout=20):
         raw = resp.read()
         if not raw:
             raise ValueError("empty body")
-        # Assume utf-8
+        # Be paranoid: reject obvious HTML
+        if raw[:32].lstrip().startswith(b"<!DOCTYPE") or raw[:1] == b"<":
+            raise ValueError("non_json_like_body")
         text = raw.decode("utf-8", errors="replace")
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as je:
+            raise ValueError(f"json_decode_error: {je}")
 
 def fetch_submissions_json(cik10, base):
     """Try both /sec/submissions and /submissions paths against the proxy base."""
-    paths = [
-        f"{base.rstrip('/')}/submissions/CIK{cik10}.json",      # if base already ends with /sec
-        f"{base.rstrip('/')}/sec/submissions/CIK{cik10}.json",  # in case base is just the worker root
-    ]
+    b = base.rstrip("/")
+    bases = [b]
+    if not b.endswith("/sec"):
+        bases.append(b + "/sec")
+    paths = [f"{bb}/submissions/CIK{cik10}.json" for bb in bases]
+
     last_err = None
-    for attempt in range(1, 5):  # up to 4 tries with backoff
+    for attempt in range(1, 5):  # up to 4 tries with backoff + jitter
         for u in paths:
             try:
                 return request_json(u)
-            except urlerr.HTTPError as he:
-                # Bubble up 403/404 after retries; log as warn
-                last_err = he
             except Exception as e:
                 last_err = e
-        # simple backoff
-        time.sleep(0.5 * attempt)
+        time.sleep(0.4 * attempt + random.uniform(0, 0.2))
     if last_err: raise last_err
     raise RuntimeError("failed to fetch submissions json")
 
@@ -173,6 +177,9 @@ def main():
 
     nasdaq_path, other_path, tickers_path, out_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     os.makedirs(out_dir, exist_ok=True)
+
+    print(f"[INFO] Using UA={UA}")
+    print(f"[INFO] Using SEC base={SEC_BASE}")
 
     print("[INFO] Reading NasdaqTrader lists…")
     nas = parse_nasdaq_listed(nasdaq_path)
@@ -186,29 +193,20 @@ def main():
     cik_to_ticker = load_tickers_map(tickers_path)
     print(f"[DEBUG] load_tickers_map: size={len(cik_to_ticker)}")
 
-    # Build ticker->cik map for eligible set
-    pairs = []
+    # Build ticker->cik map and select eligible pairs
+    ticker_to_cik = {tic: cik for cik, tic in cik_to_ticker.items()}
+    fixed_pairs = []
     missing = 0
     for r in eligible:
         sym = norm_ticker(r["symbol"])
-        # invert map: cik map is cik10->ticker, so search by value is O(1) if we prebuild
-        # but we only need cik for eligible; build a small lookup
-        # Build once:
-        # (small trick: create a dict ticker->cik for eligible on demand to avoid a 10k scan each loop)
-        # We'll construct a small set of eligible tickers and then backfill cik.
-        pairs.append((sym, None))
-    # build ticker->cik once
-    ticker_to_cik = {tic: cik for cik, tic in cik_to_ticker.items()}
-    fixed_pairs = []
-    for sym, _ in pairs:
         cik = ticker_to_cik.get(sym)
         if cik:
             fixed_pairs.append((sym, cik))
         else:
             missing += 1
+
     print(f"[INFO] Eligible={len(eligible)} pairs_with_cik={len(fixed_pairs)} missing_cik={missing} via={SEC_BASE}")
 
-    # Output files
     out_csv = os.path.join(out_dir, "latest-sic-by-symbol.csv")
     out_meta = os.path.join(out_dir, "sic-meta.json")
 
@@ -218,46 +216,62 @@ def main():
         w.writerow(["symbol","cik","sic","sic_desc","source","fetch_ts"])
 
     ok = 0
-    miss = 0
     wrote = 0
+    errs = {"http403":0, "http404":0, "empty":0, "non_json":0, "other":0}
     start = time.time()
 
     with open(out_csv, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         for i, (sym, cik10) in enumerate(fixed_pairs, 1):
-            # throttle ~0.13s/request ≈ 7.6 rps
-            time.sleep(0.13)
+            # ~5–6 rps with light jitter
+            time.sleep(0.18 + random.uniform(0, 0.05))
             try:
                 j = fetch_submissions_json(cik10, SEC_BASE)
                 sic = str(j.get("sic") or "").strip()
                 desc = (j.get("sicDescription") or j.get("sic_description") or "").strip()
                 if not sic:
-                    miss += 1
+                    errs["empty"] += 1
                     print(f"[WARN] No SIC for {sym} CIK{cik10}")
                     continue
-                w.writerow([sym, cik10, sic, desc, "sec_submissions", datetime.utcnow().date().isoformat()])
+                w.writerow([sym, cik10, sic, desc, "sec_submissions", datetime.now(timezone.utc).date().isoformat()])
                 ok += 1
                 wrote += 1
             except urlerr.HTTPError as he:
-                miss += 1
-                print(f"[WARN] HTTP {he.code} for {SEC_BASE}/submissions/CIK{cik10}.json (try over): {sym}")
+                if he.code == 403:
+                    errs["http403"] += 1
+                elif he.code == 404:
+                    errs["http404"] += 1
+                else:
+                    errs["other"] += 1
+                print(f"[WARN] HTTP {he.code} for submissions CIK{cik10} (try over): {sym}")
+            except ValueError as ve:
+                msg = str(ve)
+                if "non_json_like_body" in msg or "json_decode_error" in msg:
+                    errs["non_json"] += 1
+                elif "empty body" in msg:
+                    errs["empty"] += 1
+                else:
+                    errs["other"] += 1
+                print(f"[WARN] SIC fail {sym} CIK{cik10}: {msg}")
             except Exception as e:
-                miss += 1
+                errs["other"] += 1
                 print(f"[WARN] SIC fail {sym} CIK{cik10}: {e}")
 
+    dur = time.time() - start
     meta = {
         "eligible_symbols": len(eligible),
         "pairs_with_cik": len(fixed_pairs),
-        "requests_made": ok + miss,
+        "requests_made": ok + sum(errs.values()),
         "rows_written": wrote,
         "missing_cik_symbols": missing,
+        "errors": errs,
         "generated_utc": utc_now_iso(),
+        "duration_sec": round(dur, 1),
     }
     with open(out_meta, "w", encoding="utf-8") as mf:
         json.dump(meta, mf)
 
-    dur = time.time() - start
-    print(f"[INFO] SIC done. ok={ok} miss={miss} rows={wrote} in {dur:.1f}s")
+    print(f"[INFO] SIC done. ok={ok} miss={sum(errs.values())} rows={wrote} in {dur:.1f}s")
 
 if __name__ == "__main__":
     main()

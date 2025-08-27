@@ -1,7 +1,7 @@
-# build-shares.yml — v1.4.0
-# - FIX: add explicit 'Deploy to GitHub Pages' job (actions/deploy-pages@v4)
-# - Adds env SIC_PROXY_BASE to route SEC submissions via your Worker
-# - Keeps daily build + monthly heartbeat schedule
+# build-shares.yml — v1.4.1
+# - Passes SEC_SIC_PROXY_BASE explicitly to SIC step
+# - Prints effective env for clarity
+# - Daily build + monthly heartbeat + Pages deploy
 
 name: Build SEC Shares
 
@@ -22,9 +22,9 @@ concurrency:
 
 env:
   UA: "Mozilla/5.0 MicroCap microcap@gmail.com"
-  # Point this at your Worker that proxies SEC endpoints (see Worker code below).
-  # Leave empty to hit data.sec.gov directly (not recommended on GH Actions).
+  # Your Worker proxy for SEC (recommended). Keep both names for safety.
   SIC_PROXY_BASE: "https://microcapsec.calvinchanht.workers.dev/sec"
+  SEC_SIC_PROXY_BASE: "https://microcapsec.calvinchanht.workers.dev/sec"
 
 jobs:
   build:
@@ -33,6 +33,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Echo effective env
+        run: |
+          echo "UA=$UA"
+          echo "SIC_PROXY_BASE=$SIC_PROXY_BASE"
+          echo "SEC_SIC_PROXY_BASE=$SEC_SIC_PROXY_BASE"
 
       - name: Create work dirs
         run: |
@@ -49,7 +55,7 @@ jobs:
                -o companyfacts.zip \
                https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
           if ! unzip -tq companyfacts.zip >/dev/null 2>&1; then
-            echo "[ERROR] Bad zip (maybe got HTML). First 60 lines:"; head -n 60 companyfacts.zip || true
+            echo "[ERROR] Bad zip (maybe HTML). First 60 lines:"; head -n 60 companyfacts.zip || true
             exit 1
           fi
 
@@ -87,6 +93,7 @@ jobs:
         env:
           UA: ${{ env.UA }}
           SIC_PROXY_BASE: ${{ env.SIC_PROXY_BASE }}
+          SEC_SIC_PROXY_BASE: ${{ env.SEC_SIC_PROXY_BASE }}
         run: |
           set -e
           python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
