@@ -1,9 +1,9 @@
-# extract_shares.py — v1.4.0
-# - Adds SIC to outputs when present in companyfacts JSON (top-level "sic")
-# - Keeps tolerant discovery (cf/ or cf/**/CIK*.json)
+# extract_shares.py — v1.3.0
+# - Tolerates cf/ or cf/companyfacts layouts (recursive discovery)
+# - Stronger symbol mapping from SEC tickers JSON (object-of-objects)
 # - Emits:
-#     public/latest-shares.jsonl   (history; now includes "sic")
-#     public/latest-by-symbol.csv  (latest per symbol; header adds "sic")
+#     public/latest-shares.jsonl   (all historical rows)
+#     public/latest-by-symbol.csv  (most recent per symbol)
 #     public/meta.json             (counters & sources)
 #
 # Usage:
@@ -17,7 +17,7 @@ def utc_date():
 
 def is_share_unit(k: str) -> bool:
     k = (k or "").lower()
-    return "share" in k  # accept "shares", "pureShares", etc.
+    return "share" in k
 
 def load_ticker_map(tickers_path: str):
     with open(tickers_path, "r", encoding="utf-8") as f:
@@ -45,10 +45,12 @@ def load_ticker_map(tickers_path: str):
             cik10 = ("0000000000"+ "".join([c for c in cik if c.isdigit()]))[-10:]
             tmap[cik10] = tic
     else:
+        # unknown shape; return empty
         pass
     return tmap
 
 def iter_companyfacts_files(root: str):
+    # accept cf/ or cf/companyfacts/, walk recursively to be robust
     pattern = os.path.join(root, "**", "CIK*.json")
     for path in glob.iglob(pattern, recursive=True):
         if os.path.isfile(path):
@@ -78,6 +80,7 @@ def extract_series(j: dict):
         if not isinstance(arr, list):
             continue
         for rec in arr:
+            # rec: {"start": "...", "end": "YYYY-MM-DD", "val": number, "form": "...", ...}
             end = rec.get("end") or rec.get("instant") or ""
             try:
                 val = float(rec.get("val"))
@@ -108,13 +111,14 @@ def main():
     csv_path   = os.path.join(out_dir, "latest-by-symbol.csv")
     meta_path  = os.path.join(out_dir, "meta.json")
 
+    # Write JSONL (history) + build latest-per-symbol map
     total_rows = 0
     latest_per_cik = {}  # cik10 -> (end, val)
-    sic_by_cik = {}      # cik10 -> sic (string), when present
 
     with open(jsonl_path, "w", encoding="utf-8") as jsonl:
         for fp in files:
             fname = os.path.basename(fp)
+            # Extract CIK from filename if possible
             cik10 = ("".join([c for c in fname if c.isdigit()]))[-10:]
             try:
                 with open(fp, "r", encoding="utf-8") as f:
@@ -122,25 +126,21 @@ def main():
             except Exception:
                 continue
 
+            # Trust embedded CIK if present
             embedded = str(j.get("cik") or "").strip()
             if embedded:
                 cik10 = ("0000000000" + "".join([c for c in embedded if c.isdigit()]))[-10:]
-
-            # Capture sic if present at top level
-            sic = str(j.get("sic") or "").strip()
-            if sic:
-                sic_by_cik[cik10] = sic
 
             series = extract_series(j)
             if not series:
                 continue
 
+            # sort by end date ascending and append to JSONL
             series.sort(key=lambda x: x[0])
             for end, val in series:
                 rec = {
-                    "symbol": tmap.get(cik10, ""),
+                    "symbol": tmap.get(cik10, ""),  # filled later if available
                     "cik": cik10,
-                    "sic": sic,  # may be ""
                     "shares_outstanding": val,
                     "shares_asof": end,
                     "source": "sec_companyfacts",
@@ -149,21 +149,23 @@ def main():
                 jsonl.write(json.dumps(rec) + "\n")
                 total_rows += 1
 
+            # latest entry
             end, val = series[-1]
             cur = latest_per_cik.get(cik10)
             if (not cur) or (end > cur[0]):
                 latest_per_cik[cik10] = (end, val)
 
-    # latest-by-symbol.csv (add "sic" column after cik)
+    # Write latest-by-symbol.csv
+    # Header
     with open(csv_path, "w", encoding="utf-8") as csvf:
-        csvf.write("symbol,cik,sic,shares_outstanding,shares_asof,source,fetch_ts\n")
+        csvf.write("symbol,cik,shares_outstanding,shares_asof,source,fetch_ts\n")
         emitted = 0
         for cik10, (end, val) in latest_per_cik.items():
             sym = tmap.get(cik10, "")
+            # Only emit if we have a symbol map; some issuers may be private / no ticker
             if not sym:
                 continue
-            sic = sic_by_cik.get(cik10, "")
-            line = f"{sym},{cik10},{sic},{val},{end},sec_companyfacts,{fetch_ts}\n"
+            line = f"{sym},{cik10},{val},{end},sec_companyfacts,{fetch_ts}\n"
             csvf.write(line)
             emitted += 1
 
@@ -172,7 +174,7 @@ def main():
         "tickers_source": "https://www.sec.gov/files/company_tickers.json",
         "companies_scanned": len(files),
         "rows_written": total_rows,
-        "symbols_emitted": sum(1 for _ in latest_per_cik),
+        "symbols_emitted": len(latest_per_cik),
         "generated_utc": dt.now(datetime.UTC).isoformat(),
     }
     with open(meta_path, "w", encoding="utf-8") as mf:
