@@ -1,23 +1,31 @@
-# build-shares.yml — v1.3.0
-# - Fix: add SEC-compliant User-Agent to curl for companyfacts.zip and tickers.json
-# - Adds: strong validation (MIME/zip test), clearer debug, tolerant paths
-# - Schedule: daily run + monthly heartbeat commit to keep schedules alive
+# build-shares.yml — v1.4.0
+# - Adds SIC pipeline into the SAME artifact to avoid Pages overwrite
+# - Daily schedule keeps shares fresh; SIC adds ~10–15min at ~8 req/s for ~5.6k names
+# - Monthly heartbeat keeps schedules alive
+#
+# Outputs (in ./public):
+#   latest-shares.jsonl
+#   latest-by-symbol.csv
+#   meta.json
+#   latest-sic-by-symbol.csv
+#   sic-meta.json
 
-name: Build SEC Shares
+name: Build SEC Shares + SIC
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 7 * * *"   # daily ~07:17 UTC
-    - cron: "0 3 1 * *"    # monthly heartbeat commit on the 1st at 03:00 UTC
+    - cron: "17 7 * * *"   # daily ~07:17 UTC (shares + SIC)
+    - cron: "0 3 1 * *"    # monthly heartbeat commit only
 
 env:
-  UA: "Mozilla/5.0 MicroCap microcap@gmail.com"   # <-- use your descriptive UA (email/domain)
+  UA: "Mozilla/5.0 MicroCap microcap@gmail.com"   # your descriptive UA (email/domain)
 
 jobs:
   build:
-    if: github.event.schedule != '0 3 1 * *'   # skip build job during heartbeat
+    if: github.event.schedule != '0 3 1 * *'   # skip build during heartbeat
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,36 +44,22 @@ jobs:
                -H "Accept-Encoding: identity" \
                -o companyfacts.zip \
                https://www.sec.gov/Archives/edgar/daily-index/xbrl/companyfacts.zip
-
-          echo "[DEBUG] File(1):"; file -b companyfacts.zip || true
-          echo "[DEBUG] Size  (bytes):"; stat -c%s companyfacts.zip || stat -f%z companyfacts.zip || true
-
-          # Quick sanity: must not be HTML/text, and must be a valid zip
+          # Validate zip content
           if file companyfacts.zip | grep -iE 'HTML|ASCII|text' >/dev/null 2>&1; then
-            echo "[ERROR] Downloaded content looks like HTML/text (probably an error page). First 60 lines follow:"
+            echo "[ERROR] Looks like HTML/text (error page). First 60 lines:"
             head -n 60 companyfacts.zip || true
             exit 1
           fi
-
-          # Validate it's a real zip
-          if ! unzip -tq companyfacts.zip >/dev/null 2>&1; then
-            echo "[ERROR] Zip integrity test failed. First 60 lines follow:"
-            head -n 60 companyfacts.zip || true
-            exit 1
-          fi
+          unzip -tq companyfacts.zip >/dev/null 2>&1 || (echo "[ERROR] Zip integrity test failed" && exit 1)
 
       - name: Unzip companyfacts
         run: |
           set -e
           unzip -q companyfacts.zip -d cf
-          echo "[DEBUG] Top level after unzip:"
-          ls -lh | head -50 || true
-          echo "[DEBUG] cf listing (first 50):"
-          ls -1 cf | head -50 || true
-          echo "[DEBUG] Count of JSON files right under cf:"
-          find cf -maxdepth 1 -type f -name 'CIK*.json' | wc -l
+          echo "[DEBUG] Count of JSON files under cf:"
+          find cf -type f -name 'CIK*.json' | wc -l
 
-      - name: Download SEC tickers (with UA) + convert
+      - name: Download SEC tickers (with UA)
         run: |
           set -e
           curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
@@ -73,7 +67,6 @@ jobs:
                -H "Accept-Encoding: identity" \
                -o tickers.json \
                https://www.sec.gov/files/company_tickers.json
-          # quick peek to ensure JSON isn’t an HTML error
           if head -n1 tickers.json | grep -i '<!DOCTYPE' >/dev/null 2>&1; then
             echo "[ERROR] Tickers JSON looks like HTML. First 60 lines:"
             head -n 60 tickers.json
@@ -81,35 +74,57 @@ jobs:
           fi
           wc -c tickers.json || true
 
+      - name: Download NasdaqTrader listings (with UA)
+        run: |
+          set -e
+          curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
+               -H "User-Agent: $UA" \
+               -o nasdaqlisted.txt \
+               https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt
+          curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
+               -H "User-Agent: $UA" \
+               -o otherlisted.txt \
+               https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt
+          wc -l nasdaqlisted.txt otherlisted.txt || true
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      - name: Run extractor
+      - name: Run shares extractor
         run: |
           set -e
           python3 extract_shares.py cf tickers.json public
-          echo "[INFO] Outputs in ./public:"
+          echo "[INFO] Shares outputs in ./public:"
           ls -lh public
           echo "[INFO] Rows in latest-shares.jsonl:"
           wc -l public/latest-shares.jsonl || true
           echo "[INFO] meta.json:"
           jq '.' public/meta.json
 
-      - name: Upload Pages artifact
+      - name: Build SIC (throttled ~8 req/s)
+        env:
+          UA: ${{ env.UA }}
+        run: |
+          set -e
+          python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
+          echo "[INFO] SIC outputs in ./public:"
+          ls -lh public
+          echo "[INFO] sic-meta.json:"
+          jq '.' public/sic-meta.json
+
+      - name: Upload Pages artifact (combined)
         uses: actions/upload-pages-artifact@v3
         with:
           path: public
 
   heartbeat:
-    # Only run the heartbeat commit on the monthly schedule; otherwise skip
     if: github.event.schedule == '0 3 1 * *'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Heartbeat commit to keep schedules alive
         run: |
           set -e
