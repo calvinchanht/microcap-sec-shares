@@ -12,7 +12,7 @@ on:
     - cron: "0 3 1 * *"    # monthly heartbeat commit
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -118,23 +118,36 @@ jobs:
         uses: actions/deploy-pages@v4
 
   heartbeat:
-    if: github.event.schedule == '0 3 1 * *'
+    # allow monthly cron OR manual run
+    if: (github.event_name == 'schedule' && github.event.schedule == '0 3 1 * *') || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # ensure branch metadata is present
+
       - name: Heartbeat commit
         run: |
           set -e
+          # Configure author
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin ${{ github.ref_name }}
-          git checkout ${{ github.ref_name }}
+
+          # Determine branch safely
+          BR="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
+          git pull --rebase origin "$BR" || true
+
+          # Write/update the heartbeat file
           mkdir -p automation
           date -u +"%Y-%m-%dT%H:%M:%SZ" > automation/heartbeat.txt
           git add automation/heartbeat.txt
+
+          # Commit only if changed; then push
           if git commit -m "automation: heartbeat"; then
-            git push origin ${{ github.ref_name }}
+            git push origin "$BR"
           else
             echo "[INFO] No heartbeat change."
           fi
