@@ -1,7 +1,8 @@
-# build-shares.yml — v1.4.1
-# - Passes SEC_SIC_PROXY_BASE explicitly to SIC step
-# - Prints effective env for clarity
-# - Daily build + monthly heartbeat + Pages deploy
+# build-shares.yml — v1.5.0
+# Fixes:
+# - Reclaim disk space on ubuntu-latest runner to avoid ENOSPC during build.
+# - Heartbeat job pushes with explicit GITHUB_TOKEN-authenticated remote.
+# Behavior unchanged otherwise.
 
 name: Build SEC Shares
 
@@ -31,8 +32,31 @@ jobs:
     if: github.event.schedule != '0 3 1 * *'
     runs-on: ubuntu-latest
     steps:
+      # --- Disk space guardrails (avoid ENOSPC) ---
+      - name: Show initial disk usage
+        run: |
+          df -h
+          echo "--- Top-level sizes under /opt (best effort) ---"
+          sudo du -sh /opt/* 2>/dev/null | sort -h | tail -n 20 || true
+
+      - name: Free disk space (runner cleanup)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+          android: true
+          dotnet: true
+          haskell: true
+
+      - name: Show disk after cleanup
+        run: df -h
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Echo effective env
         run: |
@@ -63,6 +87,7 @@ jobs:
         run: |
           set -e
           unzip -q companyfacts.zip -d cf
+          rm -f companyfacts.zip   # reclaim space immediately
           echo "[DEBUG] Count of CIK*.json:"; find cf -type f -name 'CIK*.json' | wc -l
 
       - name: Download NasdaqTrader lists (UA) + tickers (UA)
@@ -73,7 +98,7 @@ jobs:
             https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt
           curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
             -H "User-Agent: $UA" -o otherlisted.txt \
-            https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt
+            https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt
           curl -L --fail --retry 5 --retry-all-errors --retry-delay 2 \
             -H "User-Agent: $UA" -H "Accept-Encoding: identity" -o tickers.json \
             https://www.sec.gov/files/company_tickers.json
@@ -82,11 +107,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+          cache: 'pip'
 
       - name: Run shares extractor
         run: |
           set -e
           python3 extract_shares.py cf tickers.json public
+          # The 'cf' tree is ~GBs; drop it now to avoid filling disk later.
+          rm -rf cf
           echo "[INFO] Shares artifacts:"; ls -lh public
 
       - name: Run SIC builder (proxy via Worker)
@@ -97,6 +125,8 @@ jobs:
         run: |
           set -e
           python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
+          # Clean small inputs (not required for artifact)
+          rm -f nasdaqlisted.txt otherlisted.txt tickers.json || true
           echo "[INFO] SIC artifacts:"; ls -lh public
           echo "[INFO] sic-meta.json:"; jq '.' public/sic-meta.json
 
@@ -124,17 +154,24 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout (with token persisted)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # ensure branch metadata is present
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Heartbeat commit
+      - name: Heartbeat commit (push with explicit token remote)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           # Configure author
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Ensure the remote uses the token
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           # Determine branch safely
           BR="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
