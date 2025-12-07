@@ -1,8 +1,8 @@
-# build-shares.yml — v1.5.0
+# build-shares.yml — v1.5.1
 # Fixes:
-# - Reclaim disk space on ubuntu-latest runner to avoid ENOSPC during build.
-# - Heartbeat job pushes with explicit GITHUB_TOKEN-authenticated remote.
-# Behavior unchanged otherwise.
+# - Remove pip caching (no requirements file) to silence "No file ... matched" message.
+# - Keep disk-space reclamation to avoid ENOSPC.
+# - Heartbeat pushes using the job’s GITHUB_TOKEN.
 
 name: Build SEC Shares
 
@@ -23,7 +23,6 @@ concurrency:
 
 env:
   UA: "Mozilla/5.0 MicroCap microcap@gmail.com"
-  # Your Worker proxy for SEC (recommended). Keep both names for safety.
   SIC_PROXY_BASE: "https://microcapsec.calvinchanht.workers.dev/sec"
   SEC_SIC_PROXY_BASE: "https://microcapsec.calvinchanht.workers.dev/sec"
 
@@ -35,9 +34,7 @@ jobs:
       # --- Disk space guardrails (avoid ENOSPC) ---
       - name: Show initial disk usage
         run: |
-          df -h
-          echo "--- Top-level sizes under /opt (best effort) ---"
-          sudo du -sh /opt/* 2>/dev/null | sort -h | tail -n 20 || true
+          df -h || true
 
       - name: Free disk space (runner cleanup)
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -51,7 +48,7 @@ jobs:
           haskell: true
 
       - name: Show disk after cleanup
-        run: df -h
+        run: df -h || true
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -87,7 +84,7 @@ jobs:
         run: |
           set -e
           unzip -q companyfacts.zip -d cf
-          rm -f companyfacts.zip   # reclaim space immediately
+          rm -f companyfacts.zip
           echo "[DEBUG] Count of CIK*.json:"; find cf -type f -name 'CIK*.json' | wc -l
 
       - name: Download NasdaqTrader lists (UA) + tickers (UA)
@@ -107,13 +104,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-          cache: 'pip'
+          # NOTE: removed "cache: pip" since there is no requirements file
 
       - name: Run shares extractor
         run: |
           set -e
           python3 extract_shares.py cf tickers.json public
-          # The 'cf' tree is ~GBs; drop it now to avoid filling disk later.
+          # Reclaim space early
           rm -rf cf
           echo "[INFO] Shares artifacts:"; ls -lh public
 
@@ -125,7 +122,6 @@ jobs:
         run: |
           set -e
           python3 build_sic.py nasdaqlisted.txt otherlisted.txt tickers.json public
-          # Clean small inputs (not required for artifact)
           rm -f nasdaqlisted.txt otherlisted.txt tickers.json || true
           echo "[INFO] SIC artifacts:"; ls -lh public
           echo "[INFO] sic-meta.json:"; jq '.' public/sic-meta.json
@@ -166,23 +162,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          # Configure author
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Ensure the remote uses the token
           git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-
-          # Determine branch safely
           BR="${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}"
           git pull --rebase origin "$BR" || true
-
-          # Write/update the heartbeat file
           mkdir -p automation
           date -u +"%Y-%m-%dT%H:%M:%SZ" > automation/heartbeat.txt
           git add automation/heartbeat.txt
-
-          # Commit only if changed; then push
           if git commit -m "automation: heartbeat"; then
             git push origin "$BR"
           else
